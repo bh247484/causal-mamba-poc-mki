@@ -8,7 +8,8 @@ class EncoderBlock(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             AdjustableConv1d(in_channels, out_channels, kernel_size, stride, lookahead),
-            nn.ReLU(),
+            # Swap ReLU for the custom GLU (SiLU variant) for richer harmonics
+            Activation(activation="SiLU", bypass_channels=0),
             # 1x1 Convs don't shift the time axis, so standard Conv1d is fine here
             nn.Conv1d(out_channels, out_channels, kernel_size=1) 
         )

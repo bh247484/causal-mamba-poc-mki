@@ -30,5 +30,14 @@ class UnifiedMambaBlock(nn.Module):
             )
             self.block = MinimalMamba(config)
 
-    def forward(self, x):
-        return self.block(x)
+
+    def forward(self, x, inference_params=None):
+        if HAS_OFFICIAL_MAMBA and torch.cuda.is_available():
+            # The official CUDA implementation natively accepts the cache object
+            return self.block(x, inference_params=inference_params)
+        else:
+            # MinimalMamba processes the whole sequence statically.
+            # (Note: For strictly local streaming tests on a Mac/CPU without Triton, 
+            # the Mamba state won't persist perfectly, but it will still validate 
+            # the U-Net overlap-add math before cloud GPU training).
+            return self.block(x)

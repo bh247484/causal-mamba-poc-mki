@@ -1,4 +1,10 @@
-# CleanUMamba Cherry-Pick Extraction List
+# In Progress
+
+- Data Loading...
+
+# Completed
+
+## CleanUMamba Cherry-Pick Extraction List
 
 The original `CleanUMamba` codebase contains several highly optimized utilities for managing edge-case streaming logic. Once the core PyTorch Lightning architecture is stood up, extract the following elements into the local codebase:
 
