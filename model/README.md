@@ -8,7 +8,7 @@ Crucially, this architecture bridges the gap between Python-based offline traini
 
 ---
 
-## 🏗️ Core Architecture
+## Core Architecture
 
 The network acts as an autoencoder, compressing raw audio into a dense latent space so the Mamba blocks can track global acoustic context without thrashing CPU caches, before upsampling back to a clean waveform.
 
@@ -28,7 +28,7 @@ The network acts as an autoencoder, compressing raw audio into a dense latent sp
 
 ---
 
-## ⏱️ The Streaming Inference Engine
+## The Streaming Inference Engine
 
 Standard PyTorch is stateless. Passing a 10-second audio file through a U-Net calculates the receptive fields for the entire file at once. In live VoIP, audio arrives in continuous 10-millisecond buffers. If fed naively into a stateless U-Net, the convolutional layers and Mamba blocks will drop their acoustic memory at every boundary, causing severe audio stuttering.
 
@@ -47,7 +47,7 @@ When operating in live inference mode (`model.feed()`), the model bypasses the s
 
 ---
 
-## ⚙️ Mathematical & Structural Optimizations
+## Mathematical & Structural Optimizations
 
 ### Macro vs. Micro Padding
 To prevent PyTorch from breaking the audio stream, the model handles two distinct types of padding:
@@ -65,7 +65,7 @@ The model optimizes against two simultaneous objectives:
 
 ---
 
-## 🧪 Testing the Streaming Logic (The U-Net Isolation Test)
+## Testing the Streaming Logic (The U-Net Isolation Test)
 
 Before deploying to a C++ environment, the Python streaming logic must be validated. Because pure-Python Mamba fallbacks (used on local machines without Triton/CUDA) cannot perfectly persist the `inference_params` state, you must run the **U-Net Isolation Test**.
 
