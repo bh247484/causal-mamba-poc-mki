@@ -1,0 +1,3 @@
+# For official, cude optimized mamba implementation
+mamba-ssm
+causal-conv1d

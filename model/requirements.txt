@@ -1,11 +1,9 @@
 torch
 torchaudio
 pytorch-lightning
+tensorboard
 numpy
 # For cpu and mac compatible mamba implemntation
 mambapy
-# For official, cude optimized mamba implementation
-mamba-ssm
-causal-conv1d
 # For STFT loss
 auraloss
