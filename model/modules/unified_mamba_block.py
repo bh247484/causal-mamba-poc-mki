@@ -5,23 +5,29 @@ import torch.nn as nn
 try:
     from mamba_ssm import Mamba as OfficialMamba
     HAS_OFFICIAL_MAMBA = True
+
+    # Explicitly bind the fallbacks so Pylance knows they exist
+    MinimalMamba = None 
+    MambaConfig = None
 except ImportError:
-    HAS_OFFICIAL_MAMBA = False
     from mambapy.mamba import Mamba as MinimalMamba, MambaConfig
+    HAS_OFFICIAL_MAMBA = False
+    # Explicitly bind the official version so Pylance knows it exists
+    OfficialMamba = None
 
 class UnifiedMambaBlock(nn.Module):
     def __init__(self, d_model, d_state=16, d_conv=4, expand=2):
         super().__init__()
         
         # 2. Check BOTH the package presence and the hardware presence
-        if HAS_OFFICIAL_MAMBA and torch.cuda.is_available():
+        if HAS_OFFICIAL_MAMBA and torch.cuda.is_available() and OfficialMamba is not None:
             self.block = OfficialMamba(
                 d_model=d_model, 
                 d_state=d_state, 
                 d_conv=d_conv, 
                 expand=expand
             )
-        else:
+        elif MambaConfig is not None and MinimalMamba is not None:
             config = MambaConfig(
                 d_model=d_model, 
                 n_layers=1, 
@@ -29,6 +35,8 @@ class UnifiedMambaBlock(nn.Module):
                 expand_factor=expand
             )
             self.block = MinimalMamba(config)
+        else:
+            raise RuntimeError("Failed to initialize Mamba block. Check your mamba dependencies.")
 
 
     def forward(self, x, inference_params=None):
