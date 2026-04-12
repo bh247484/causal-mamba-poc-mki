@@ -1,5 +1,7 @@
 import torch
 import pytorch_lightning as pl
+from pytorch_lightning.loggers import TensorBoardLogger
+from typing import cast
 
 class TensorBoardAudioCallback(pl.Callback):
     """
@@ -11,16 +13,21 @@ class TensorBoardAudioCallback(pl.Callback):
         super().__init__()
         self.log_every_n_epochs = log_every_n_epochs
         self.sample_rate = sample_rate
-        self.fixed_noisy = None
-        self.fixed_clean = None
+        self.fixed_noisy: torch.Tensor | None = None
+        self.fixed_clean: torch.Tensor | None = None
 
     def on_fit_start(self, trainer, pl_module):
         """
         Called once at the very beginning of the trainer.fit() execution.
         We extract a single batch from the validation dataloader to serve as our anchor.
         """
+        # Use getattr to bypass Pylance's missing type stubs for PyTorch Lightning
+        datamodule = getattr(trainer, "datamodule", None)
+        if datamodule is None:
+            raise RuntimeError("No datamodule on trainer")
+        
         # 1. Grab the validation dataloader
-        val_loader = trainer.datamodule.val_dataloader()
+        val_loader = datamodule.val_dataloader()
         
         # 2. Extract the first batch using an iterator
         noisy_batch, clean_batch = next(iter(val_loader))
@@ -32,13 +39,25 @@ class TensorBoardAudioCallback(pl.Callback):
         self.fixed_clean = clean_batch[0].unsqueeze(0)
 
         # 4. Log the baseline ground-truth files to TensorBoard at step 0
-        tensorboard = trainer.logger.experiment
+        # Ensure logger exists and is specifically TensorBoard
+        if trainer.logger is None:
+            raise RuntimeError("No logger on trainer")
+        tb_logger = cast(TensorBoardLogger, trainer.logger)
+        tensorboard = tb_logger.experiment
+
+        if self.fixed_noisy is None:
+            raise RuntimeError("fixed_noisy tensor is None")
+        
         tensorboard.add_audio(
             'Audio/1_Noisy_Input_Val', 
             self.fixed_noisy[0, 0], 
             global_step=0, 
             sample_rate=self.sample_rate
         )
+
+        if self.fixed_clean is None:
+            raise RuntimeError("fixed_clean tensor is None")
+        
         tensorboard.add_audio(
             'Audio/2_Clean_Target_Val', 
             self.fixed_clean[0, 0], 
@@ -55,6 +74,9 @@ class TensorBoardAudioCallback(pl.Callback):
         # Only log every N epochs
         if trainer.current_epoch % self.log_every_n_epochs != 0 and trainer.current_epoch != 0:
             return
+        
+        if self.fixed_noisy is None:
+            raise RuntimeError("fixed_noisy tensor is None")
 
         # Ensure the fixed tensor is on the correct device
         if self.fixed_noisy.device != pl_module.device:
@@ -66,7 +88,12 @@ class TensorBoardAudioCallback(pl.Callback):
         predicted_clean = pl_module(self.fixed_noisy)
         
         # 2. Log to TensorBoard
-        tensorboard = trainer.logger.experiment
+        # Ensure logger exists and is specifically TensorBoard
+        if trainer.logger is None:
+            raise RuntimeError("No logger on trainer")
+        tb_logger = cast(TensorBoardLogger, trainer.logger)
+        tensorboard = tb_logger.experiment
+
         tensorboard.add_audio(
             'Audio/3_Predicted_Output_Val', 
             predicted_clean[0, 0].cpu(), # Move back to CPU for logging

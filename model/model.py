@@ -8,6 +8,7 @@ from utils.init import weight_scaling_init
 from utils.padding import pad_signal, get_valid_length
 from utils.streaming import StreamingInferenceMixin
 from layers import EncoderBlock, DecoderBlock
+from typing import cast
 
 # --- The PyTorch Lightning Wrapper ---
 
@@ -267,26 +268,33 @@ class EdgeAudioUSE(pl.LightningModule, StreamingInferenceMixin):
 
         # 3. The Decoder (With Overlap-Add)
         skips = skips[::-1]
-        for i, block in enumerate(self.decoder):
+        for i, _block in enumerate(self.decoder):
+            # Forcibly tell Pylance: "This generic module is actually a DecoderBlock"
+            block = cast(DecoderBlock, _block)
             skip = skips[i][..., :x.shape[-1]]
             x = x + skip
             
             # The decoder block consists of [1x1 Conv, ReLU, TransposedConv, ReLU]
             # We step through them manually to handle the state caching
-            x = block.net[0](x) # 1x1 Conv
-            x = block.net[1](x) # ReLU
+            x = block.conv1x1(x)
+            x = block.relu1(x)
             # Call the raw conv_t module directly to bypass the Adjustable auto-trimmer
             # or else we'll double trim the overlap.
-            x = block.net[2].conv_t(x)
+            x = block.trans_conv.conv_t(x)
             
             # Get the previous overlap
             prev_state = self.encoder_decoder_state.get(f"dec{i}", None)
 
             overlap_len = self.kernel_size - self.stride
+
+            # Safely handle the bias to satisfy Pylance (and prevent edge-case crashes)
+            bias_val = 0
+            if block.trans_conv.conv_t.bias is not None:
+                bias_val = block.trans_conv.conv_t.bias.view(-1, 1)
             
             # Save the current trailing edge for the next frame
             # And subtract bias so we don't count it twice across two frames
-            self.encoder_decoder_state[f"dec{i}"] = x[..., -overlap_len:] - block.net[2].conv_t.bias.view(-1, 1)
+            self.encoder_decoder_state[f"dec{i}"] = x[..., -overlap_len:] - bias_val
             
             # Trim the trailing edge off the current frame
             x = x[..., :-overlap_len]
