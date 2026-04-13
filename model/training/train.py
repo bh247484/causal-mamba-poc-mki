@@ -3,23 +3,17 @@ import pytorch_lightning as pl
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.callbacks import ModelCheckpoint
 from callbacks import TensorBoardAudioCallback
-
-# Import the architecture and data modules we built previously
-# Assuming they are saved in model.py and dataset.py
 from ..model import EdgeAudioUSE
 from ..datasets.voicebank_dataset import VoiceBankDataModule
 
 # Run `tensorboard --logdir=tb_logs` to launch tensorboard server after script starts
 # Server should be available at http://localhost:6006
 
-
 def main():
-    # 1. Reproducibility
     # Locks the random seed so that random cropping and weight initialization 
     # are 100% deterministic across multiple runs.
     pl.seed_everything(42)
 
-    # 2. Define Data Paths
     CLEAN_DIR = "../datasets/VoiceBank-DEMAND/clean_trainset_28spk_wav"
     NOISY_DIR = "../datasets/VoiceBank-DEMAND/noisy_trainset_28spk_wav"
 
@@ -27,7 +21,6 @@ def main():
         print("Error: Dataset directories not found. Please verify the paths.")
         return
 
-    # 3. Instantiate Modules
     datamodule = VoiceBankDataModule(
         clean_dir=CLEAN_DIR, 
         noisy_dir=NOISY_DIR, 
@@ -37,7 +30,6 @@ def main():
 
     model = EdgeAudioUSE()
 
-    # 4. Configure Tracking
     # This will create a local folder structure: tb_logs/StageA_Overfit/version_X/
     logger = TensorBoardLogger("tb_logs", name="StageA_Overfit")
     
@@ -48,7 +40,6 @@ def main():
         filename="use-overfit-{epoch:02d}-{train_loss:.4f}"
     )
 
-    # 5. The Orchestrator
     trainer = pl.Trainer(
         logger=logger,
         callbacks=[
@@ -67,7 +58,7 @@ def main():
         accelerator="auto"
     )
 
-    # 6. Execute the Training Loop
+    # Execute the training loop
     print("Starting Stage A: Mathematical Overfit Sanity Check...")
     trainer.fit(model, datamodule=datamodule)
 
