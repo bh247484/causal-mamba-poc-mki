@@ -2,20 +2,22 @@ import os
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.callbacks import ModelCheckpoint
-from callbacks import TensorBoardAudioCallback
-from ..model import EdgeAudioUSE
-from ..datasets.voicebank_dataset import VoiceBankDataModule
+from training.callbacks import TensorBoardAudioCallback
+from model import EdgeAudioUSE
+from datasets.voicebank_dataset import VoiceBankDataModule
 
 # Run `tensorboard --logdir=tb_logs` to launch tensorboard server after script starts
 # Server should be available at http://localhost:6006
 
+# Run script from root as module with `python -m training.train`
 def main():
     # Locks the random seed so that random cropping and weight initialization 
     # are 100% deterministic across multiple runs.
     pl.seed_everything(42)
 
-    CLEAN_DIR = "../datasets/VoiceBank-DEMAND/clean_trainset_28spk_wav"
-    NOISY_DIR = "../datasets/VoiceBank-DEMAND/noisy_trainset_28spk_wav"
+    # Assumes we're running the script from the root python proj dir: `model/``
+    CLEAN_DIR = "datasets/VoiceBank-DEMAND/clean_trainset_28spk_wav"
+    NOISY_DIR = "datasets/VoiceBank-DEMAND/noisy_trainset_28spk_wav"
 
     if not os.path.exists(CLEAN_DIR) or not os.path.exists(NOISY_DIR):
         print("Error: Dataset directories not found. Please verify the paths.")
@@ -52,10 +54,14 @@ def main():
         # Lightning will ignore the rest of the dataset and train exclusively 
         # on the very first batch of 8 files. This isolates the U-Net math.
         overfit_batches=1,
+        # By default, only writes the loss to TensorBoard every 50 batches to save hard drive space
+        # When overfitting we only have one Epoch so we need to ask for logging every step
+        log_every_n_steps=1,
         
         # Optional: If running on a MacBook with Apple Silicon (M1/M2/M3),
         # PyTorch Lightning can automatically use the MPS (Metal Performance Shaders) backend.
         accelerator="auto"
+        
     )
 
     # Execute the training loop

@@ -7,7 +7,9 @@ class EncoderBlock(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=4, stride=2, lookahead=0):
         super().__init__()
         # Explicitly name the layers
-        self.conv = AdjustableConv1d(in_channels, out_channels, kernel_size, stride, lookahead)
+        # We need to multiply out_channels by 2 here to prep them for the subsequent GLU/SiLU layer
+        # which will cut its input channels in half.
+        self.conv = AdjustableConv1d(in_channels, out_channels * 2, kernel_size, stride, lookahead)
 
         # Swap ReLU for the custom GLU (SiLU variant) for richer harmonics
         self.activation = Activation(activation="SiLU", bypass_channels=0)

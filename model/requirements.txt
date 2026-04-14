@@ -1,5 +1,6 @@
 torch
 torchaudio
+torchcodec
 pytorch-lightning
 tensorboard
 numpy
