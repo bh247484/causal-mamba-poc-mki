@@ -124,7 +124,7 @@ class EdgeAudioUSE(pl.LightningModule, StreamingInferenceMixin):
         # ---------------------------------------------------------
 
         # Calculate the required frame length for the streaming buffer
-        self.frame_length = get_valid_length(1, self.num_encoder_layers, self.kernel_size, self.stride)
+        self.frame_length = get_valid_length(1, len(enc_channels), self.kernel_size, self.stride)
         self.init_streaming_state(channels_input=1)
 
         # ---------------------------------------------------------
