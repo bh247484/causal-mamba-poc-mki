@@ -320,12 +320,10 @@ class EdgeAudioUSE(pl.LightningModule, StreamingInferenceMixin):
         l1_loss = F.l1_loss(denoised_audio, clean_audio)
         
         # 2. Frequency-Domain Loss (Human perceptual quality)
-        # Spectral Convergence (sc):
-        # Calculates the Frobenius norm (matrix norm) of the difference between the target and predicted magnitude spectrograms, divided by the norm of the target.
-        # Log Magnitude (mag):
-        # This calculates the L1 distance (absolute error) between the logarithm of the spectrograms.
-        sc_loss, mag_loss = self.stft_loss(denoised_audio, clean_audio)
-        stft_loss = sc_loss + mag_loss
+        # Spectral Convergence loss: Calculates the Frobenius norm (matrix norm) of the difference between the target and predicted magnitude spectrograms, divided by the norm of the target.
+        # Log Magnitude loss: This calculates the L1 distance (absolute error) between the logarithm of the spectrograms.
+        # The auraloss library computes both losses above and sums them into a single stft_loss return value.
+        stft_loss = self.stft_loss(denoised_audio, clean_audio)
         
         loss = l1_loss + stft_loss
         
@@ -340,10 +338,10 @@ class EdgeAudioUSE(pl.LightningModule, StreamingInferenceMixin):
         
         # Calculate both losses for true parity with the training step
         l1_val = torch.nn.functional.l1_loss(predicted, clean)
-        stft_sc_val, stft_mag_val = self.stft_loss(predicted, clean)
+        stft_val = self.stft_loss(predicted, clean)
         
         # Combine them (using the same weighting you use in training_step)
-        loss = l1_val + stft_sc_val + stft_mag_val
+        loss = l1_val + stft_val
         
         # Log the combined metric
         self.log("val_loss", loss, prog_bar=True, sync_dist=True if torch.cuda.is_available() else False)
