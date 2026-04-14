@@ -51,11 +51,10 @@ class EdgeAudioUSE(pl.LightningModule, StreamingInferenceMixin):
             - Non-Causal (lookahead='centered'): Traditional offline processing for theoretical baselines.
             Defaults to 0.
     """
-    def __init__(self, channels_H=64, num_encoder_layers=6, d_model=512, kernel_size=4, stride=2, lookahead=0,):
+    def __init__(self, d_model=512, kernel_size=4, stride=2, lookahead=0,):
         super().__init__()
         self.save_hyperparameters()
         self.lookahead = lookahead
-        self.num_encoder_layers = num_encoder_layers
         self.kernel_size = kernel_size
         self.stride = stride
 
@@ -72,54 +71,51 @@ class EdgeAudioUSE(pl.LightningModule, StreamingInferenceMixin):
             hop_sizes=[50, 120, 240],
             win_lengths=[240, 600, 1200]
         )
-        
-        # 1. The Encoder
-        self.encoder = nn.ModuleList()
-        in_c = 1
-        out_c = channels_H
-        for i in range(num_encoder_layers):
-            self.encoder.append(
-                EncoderBlock(
-                    in_c,
-                    out_c,
-                    kernel_size=self.kernel_size,
-                    stride=self.stride,
-                    lookahead=self.lookahead
-                )
-            )
-            in_c = out_c
-            out_c = min(out_c * 2, 768) 
 
-        # 2. The Mamba Bottleneck
-        self.proj_in = nn.Conv1d(in_c, d_model, kernel_size=1)
+        # ---------------------------------------------------------
+        # Declarative U-Net Architecture
+        # ---------------------------------------------------------
+        
+        # 1. The Encoder (Walking up the channel ladder)
+        # Input to the first layer is 1 (Mono Audio)
+        enc_channels = [
+            (1, 64), 
+            (64, 128), 
+            (128, 256), 
+            (256, 512), 
+            (512, 768), 
+            (768, 768)
+        ]
+        
+        self.encoder = nn.ModuleList([
+            EncoderBlock(in_c, out_c, kernel_size, stride, lookahead) 
+            for in_c, out_c in enc_channels
+        ])
+
+        # 2. The Mamba Bottleneck (Operating at peak depth: 768)
+        self.proj_in = nn.Conv1d(768, d_model, kernel_size=1)
         self.mamba_blocks = nn.ModuleList([
             UnifiedMambaBlock(d_model=d_model, d_state=64) for _ in range(3)
         ])
-        self.proj_out = nn.Conv1d(d_model, in_c, kernel_size=1)
+        self.proj_out = nn.Conv1d(d_model, 768, kernel_size=1)
 
-        # 3. The Decoder
+        # 3. The Decoder (Walking down the ladder, catching skips, ending in Mono Audio)
+        dec_channels = [
+            (768, 768), 
+            (768, 512), 
+            (512, 256), 
+            (256, 128), 
+            (128, 64), 
+            (64, 1)      # Collapse back to mono audio
+        ]
+        
         self.decoder = nn.ModuleList()
-        for i in range(num_encoder_layers):
-            # The '//' operator is Python's "floor division" (integer division). 
-            # E.g., 128 // 2 = 64. 
-            # The inline 'if/else' statement means: halve the channels for the next layer, 
-            # UNLESS this is the very last layer, in which case force the output to 1 channel (mono audio).
-            out_c = in_c // 2 if i < num_encoder_layers - 1 else 1
-            # A boolean flag to tell the DecoderBlock whether or not to apply a ReLU activation.
-            # You don't want a ReLU on the final audio output, otherwise it cuts off the negative half of the audio wave.
-            is_last = (i == num_encoder_layers - 1)
-            self.decoder.insert(
-                0,
-                DecoderBlock(
-                    in_c,
-                    out_c,
-                    kernel_size=self.kernel_size,
-                    stride=self.stride,
-                    is_last=is_last,
-                    lookahead=self.lookahead
-                )
+        for i, (in_c, out_c) in enumerate(dec_channels):
+            # No ReLU on the absolute final layer (Index 5)
+            is_last = (i == len(dec_channels) - 1)
+            self.decoder.append(
+                DecoderBlock(in_c, out_c, kernel_size, stride, is_last, lookahead)
             )
-            in_c = out_c
 
         # ---------------------------------------------------------
         # Streaming Initialization (streaming.py)
@@ -172,6 +168,7 @@ class EdgeAudioUSE(pl.LightningModule, StreamingInferenceMixin):
         x = self.proj_out(x)
 
         for i, block in enumerate(self.decoder):
+            # U-net skip logic
             skip = skips[i][..., :x.shape[-1]]
             x = x + skip
             x = block(x)
@@ -334,6 +331,21 @@ class EdgeAudioUSE(pl.LightningModule, StreamingInferenceMixin):
         self.log('train_loss', loss, prog_bar=True)
         self.log('l1_loss', l1_loss)
         self.log('stft_loss', stft_loss)
+        return loss
+    
+    def validation_step(self, batch, batch_idx):
+        noisy, clean = batch
+        predicted = self(noisy)
+        
+        # Calculate both losses for true parity with the training step
+        l1_val = torch.nn.functional.l1_loss(predicted, clean)
+        stft_sc_val, stft_mag_val = self.stft_loss(predicted, clean)
+        
+        # Combine them (using the same weighting you use in training_step)
+        loss = l1_val + stft_sc_val + stft_mag_val
+        
+        # Log the combined metric
+        self.log("val_loss", loss, prog_bar=True, sync_dist=True if torch.cuda.is_available() else False)
         return loss
 
     def configure_optimizers(self):
