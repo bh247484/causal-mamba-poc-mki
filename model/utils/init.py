@@ -7,9 +7,16 @@ def weight_scaling_init(layer: nn.Module):
     Scales down the initial variance of convolutional filters to prevent 
     exploding gradients when the latent representation enters the Mamba bottleneck.
     """
-    w = layer.weight.detach()
+    weight = getattr(layer, 'weight', None)
+
+    if not isinstance(weight, torch.Tensor):
+        raise RuntimeError('Layer has no weight attribute or it is not of type Tensor')
+    
+    w = weight.detach()
     alpha = 10.0 * w.std()
     
-    layer.weight.data /= torch.sqrt(alpha)
-    if hasattr(layer, 'bias') and layer.bias is not None:
-        layer.bias.data /= torch.sqrt(alpha)
+    weight.data /= torch.sqrt(alpha)
+
+    bias = getattr(layer, 'bias', None)
+    if isinstance(bias, torch.Tensor):
+        bias.data /= torch.sqrt(alpha)

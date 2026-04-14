@@ -90,14 +90,25 @@ def load_pruned_state_dict(model: nn.Module, pruned_state_dict: dict):
 
         # Mamba-specific internal dimension updates
         if module.__class__.__name__ in ["Mamba", "UnifiedMambaBlock"]:
-            try:
-                module.dt_rank = module.dt_proj.in_features
-                module.d_state = (module.x_proj.out_features - module.dt_rank) // 2
-                module.d_inner = module.x_proj.in_features
-                module.d_model = module.in_proj.in_features
-                module.expand = module.d_inner / module.d_model
-            except AttributeError:
-                pass # Fails silently if using the minimal mamba package fallback
+            # Extract the projection layers
+            dt_proj = getattr(module, 'dt_proj', None)
+            x_proj = getattr(module, 'x_proj', None)
+            in_proj = getattr(module, 'in_proj', None)
+            
+            # 2. Type Guard: Prove to Pylance these are explicitly nn.Linear layers
+            if isinstance(dt_proj, nn.Linear) and isinstance(x_proj, nn.Linear) and isinstance(in_proj, nn.Linear):
+                dt_rank = dt_proj.in_features
+                d_state = (x_proj.out_features - dt_rank) // 2
+                d_inner = x_proj.in_features
+                d_model = in_proj.in_features
+                expand = d_inner / d_model
+
+                # Using setattr() here instead of direct assignment keeps Pylance linting happy
+                setattr(module, 'dt_rank', dt_rank)
+                setattr(module, 'd_state', d_state)
+                setattr(module, 'd_inner', d_inner)
+                setattr(module, 'd_model', d_model)
+                setattr(module, 'expand', expand)
 
     prune_model_from_state_dict_shapes(model, pruned_state_dict)
     model.load_state_dict(pruned_state_dict, strict=True)
