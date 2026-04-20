@@ -119,6 +119,17 @@ class EdgeAudioUSE(pl.LightningModule, StreamingInferenceMixin):
             )
 
         # ---------------------------------------------------------
+        # Learnable Skip Dampening Parameter:
+        # Initialize at 0.1 to starve the skip connections early, forcing 
+        # the Mamba blocks to learn the primary noise suppression routing.
+        #
+        # Initially introduced for as overfitting hack but architecture will also benefit from this at scale.
+        # ---------------------------------------------------------
+        self.skip_gains = nn.ParameterList([
+            nn.Parameter(torch.tensor(0.1)) for _ in range(len(self.decoder))
+        ])
+
+        # ---------------------------------------------------------
         # Streaming Initialization (streaming.py)
         # Initialize the buffers and state tracking variables required 
         # by the StreamingInferenceMixin.
@@ -171,7 +182,8 @@ class EdgeAudioUSE(pl.LightningModule, StreamingInferenceMixin):
         for i, block in enumerate(self.decoder):
             # U-net skip logic
             skip = skips[i][..., :x.shape[-1]]
-            x = x + skip
+            # Apply the learnable gain for this specific layer
+            x = x + (skip * self.skip_gains[i])
             x = block(x)
 
         # Slice off the mathematical padding before returning the final audio
@@ -258,7 +270,6 @@ class EdgeAudioUSE(pl.LightningModule, StreamingInferenceMixin):
         # Pass `self.inference_params` into the Mamba blocks so they can 
         # read the previous state and write the new state
         for mamba in self.mamba_blocks:
-            # Note: We will need to update UnifiedMambaBlock to accept inference_params
             x = mamba(x, inference_params=self.inference_params) 
             
         x = x.permute(0, 2, 1) 
@@ -269,8 +280,9 @@ class EdgeAudioUSE(pl.LightningModule, StreamingInferenceMixin):
         for i, _block in enumerate(self.decoder):
             # Forcibly tell Pylance: "This generic module is actually a DecoderBlock"
             block = cast(DecoderBlock, _block)
-            skip = skips[i][..., :x.shape[-1]]
-            x = x + skip
+            skip = skips[i][..., -x.shape[-1]:]
+            # Apply the learnable gain for this specific layer here as well
+            x = x + (skip * self.skip_gains[i])
             
             # The decoder block consists of [1x1 Conv, ReLU, TransposedConv, ReLU]
             # We step through them manually to handle the state caching
@@ -325,12 +337,30 @@ class EdgeAudioUSE(pl.LightningModule, StreamingInferenceMixin):
         # The auraloss library computes both losses above and sums them into a single stft_loss return value.
         stft_loss = self.stft_loss(denoised_audio, clean_audio)
         
-        loss = l1_loss + stft_loss
+        # @Overfit-Config: This ratio seems to work for overfitting but is probably worth revisiting
+        loss = l1_loss + (0.2 * stft_loss)
         
         self.log('train_loss', loss, prog_bar=True)
         self.log('l1_loss', l1_loss)
         self.log('stft_loss', stft_loss)
         return loss
+    
+    def on_before_optimizer_step(self, optimizer):
+        """
+        PyTorch Lightning Hook: Fires after loss.backward() but before optimizer.step().
+        This is the only safe place to inspect gradients.
+        """
+        # 1. Collect all gradients from the Mamba blocks
+        mamba_grads = [p.grad for p in self.mamba_blocks.parameters() if p.grad is not None]
+        
+        # 2. Calculate the total L2 norm of these gradients
+        if len(mamba_grads) > 0:
+            total_norm = torch.norm(torch.stack([torch.norm(g.detach(), 2) for g in mamba_grads]), 2)
+            # Log it to TensorBoard
+            self.log('mamba_grad_norm', total_norm, prog_bar=False, on_step=True, on_epoch=False)
+        else:
+            # Fallback if gradients are dropped/None
+            self.log('mamba_grad_norm', 0.0, prog_bar=False, on_step=True, on_epoch=False)
     
     def validation_step(self, batch, batch_idx):
         noisy, clean = batch
@@ -340,8 +370,8 @@ class EdgeAudioUSE(pl.LightningModule, StreamingInferenceMixin):
         l1_val = torch.nn.functional.l1_loss(predicted, clean)
         stft_val = self.stft_loss(predicted, clean)
         
-        # Combine them (using the same weighting you use in training_step)
-        loss = l1_val + stft_val
+        # @Overfit-Config: This ratio seems to work for overfitting but is probably worth revisiting
+        loss = l1_val + (0.2 * stft_val)
         
         # Log the combined metric
         self.log("val_loss", loss, prog_bar=True, sync_dist=True if torch.cuda.is_available() else False)
@@ -375,7 +405,8 @@ class EdgeAudioUSE(pl.LightningModule, StreamingInferenceMixin):
                 decay_params.append(param)
 
         optim_groups = [
-            {'params': decay_params, 'weight_decay': 0.02},
+            # {'params': decay_params, 'weight_decay': 0.02},
+            {'params': decay_params, 'weight_decay': 0.0}, # @Overfit-Config: 0.0 for overfitting, restore line above for scale training
             {'params': no_decay_params, 'weight_decay': 0.0}
         ]
         
