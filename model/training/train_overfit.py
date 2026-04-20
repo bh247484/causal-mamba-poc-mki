@@ -26,7 +26,7 @@ def main():
     datamodule = VoiceBankDataModule(
         clean_dir=CLEAN_DIR, 
         noisy_dir=NOISY_DIR, 
-        batch_size=8, 
+        batch_size=2, # @Overfit-Config: Set to 2 for overfitting run, less memory hungry
         num_workers=4 # Adjust based on your MacBook's CPU core count
     )
 
@@ -39,7 +39,8 @@ def main():
         save_top_k=1,
         monitor="train_loss", # Monitoring training loss because we are overfitting
         mode="min",
-        filename="use-overfit-{epoch:02d}-{train_loss:.4f}"
+        filename="use-overfit-{epoch:02d}-{train_loss:.4f}",
+        save_on_train_epoch_end=True
     )
 
     trainer = pl.Trainer(
@@ -54,6 +55,10 @@ def main():
         # Lightning will ignore the rest of the dataset and train exclusively 
         # on the very first batch of 8 files. This isolates the U-Net math.
         overfit_batches=1,
+        # Stops gradient from over accelerating
+        gradient_clip_val=1.0,
+        # Again for overfitting
+        deterministic=True,
         # By default, only writes the loss to TensorBoard every 50 batches to save hard drive space
         # When overfitting we only have one Epoch so we need to ask for logging every step
         log_every_n_steps=1,
