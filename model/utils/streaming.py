@@ -49,7 +49,7 @@ class StreamingInferenceMixin:
         self.frames = 0
         self.input_std = 0
         self.pending = torch.zeros(channels_input, 0, dtype=dtype, device=device)
-        self.inference_params = None
+        self.inference_params = {}
         self.encoder_decoder_state = {}
         
         # Requires the model to have stride and num_encoder_layers defined
