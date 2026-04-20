@@ -20,7 +20,8 @@ class VoiceBankDemandDataset(Dataset):
 
         # VoiceBank clean and noisy files share the exact same filenames.
         # We read the filenames from the clean directory and assume they exist in the noisy directory.
-        self.filenames = [f for f in os.listdir(clean_dir) if f.endswith('.wav')]
+        # Add sorted() to guarantee cross-platform reproducibility
+        self.filenames = sorted([f for f in os.listdir(clean_dir) if f.endswith('.wav')])
         
         if len(self.filenames) == 0:
             raise RuntimeError(f"No .wav files found in {clean_dir}")
@@ -36,6 +37,7 @@ class VoiceBankDemandDataset(Dataset):
 
     def __getitem__(self, idx):
         filename = self.filenames[idx]
+        # print(f"\n[DEBUG] PyTorch is fetching: {filename}")
         clean_path = os.path.join(self.clean_dir, filename)
         noisy_path = os.path.join(self.noisy_dir, filename)
 
@@ -55,7 +57,9 @@ class VoiceBankDemandDataset(Dataset):
         if current_length > self.chunk_length_samples:
             # Random Cropping: Pick a random starting point.
             # This ensures the model rarely sees the exact same slice of audio twice across epochs.
-            start_idx = random.randint(0, current_length - self.chunk_length_samples)
+
+            start_idx = 0 # @Overfit-Config: override to start at 0 for overfitting run, so model sees same chunk every time
+            # start_idx = random.randint(0, current_length - self.chunk_length_samples)
             end_idx = start_idx + self.chunk_length_samples
             
             # Slice both tensors identically to maintain acoustic alignment
@@ -108,7 +112,8 @@ class VoiceBankDataModule(pl.LightningDataModule):
             batch_size=self.batch_size, 
             shuffle=True, 
             num_workers=self.num_workers,
-            drop_last=True
+            drop_last=True,
+            persistent_workers=True
         )
 
     def val_dataloader(self):
@@ -118,5 +123,6 @@ class VoiceBankDataModule(pl.LightningDataModule):
             batch_size=self.batch_size, 
             shuffle=False, 
             num_workers=self.num_workers,
-            drop_last=True
+            drop_last=True,
+            persistent_workers=True
         )

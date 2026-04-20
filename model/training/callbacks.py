@@ -72,7 +72,9 @@ class TensorBoardAudioCallback(pl.Callback):
         aligns the audio generation with the calculation of the val_loss.
         """
         # Only log every N epochs
-        if trainer.current_epoch % self.log_every_n_epochs != 0 and trainer.current_epoch != 0:
+        # current_epoch is zero indexed so we need to add 1 to get multiples of log_every_n_epochs
+        epoch_num = trainer.current_epoch + 1
+        if epoch_num % self.log_every_n_epochs != 0 and epoch_num != 0:
             return
         
         if self.fixed_noisy is None:
