@@ -37,7 +37,15 @@ def main():
     model.load_state_dict(cleaned_state_dict, strict=True)
     
     # CRITICAL: Disable training behaviors (like gradient tracking)
-    model.eval() 
+    model.eval()
+
+    # Uncomment to test U-Net wrapping layers isolated/independent from mamba blocks.
+    # class DummyMamba(torch.nn.Module):
+    #     def forward(self, x, inference_params=None):
+    #         return x # Just pass the tensor right back without doing any math
+
+    # print("\n[DEBUG] Lobotomizing Mamba blocks for U-Net Isolation Test...")
+    # model.mamba_blocks = torch.nn.ModuleList([DummyMamba() for _ in range(3)])
 
     # 2. Load the Audio
     # Replace this with the actual path to the noisy file you used to overfit
@@ -71,7 +79,10 @@ def main():
     stateless_input = noisy_wav.unsqueeze(0) 
     
     with torch.no_grad():
-        output_A = model.forward(stateless_input)
+        # Need to pass mamba_streaming_parity=True so we can compare the vanilla, stateless
+        # forward pass against the stateful cached streaming pass.
+        # If we don't there will be algorithmic drift. See UnifiedMambaBlock forward pass impl for details.
+        output_A = model.forward(stateless_input, mamba_streaming_parity=False)
     
     # Remove batch and channel dims -> (Time,) for easy comparison
     output_A = output_A.squeeze() 
@@ -82,11 +93,12 @@ def main():
     print("Executing Pass B: Stateful feed() loop...")
     model.init_streaming_state(channels_input=1)
     
-    chunk_size = 160  # 10ms at 16kHz
+    # chunk_size must be power of 2
+    chunk_size = 128  # 8ms at 16kHz
     output_chunks = []
     
     with torch.no_grad():
-        # Iterate over the audio in exact 160-sample chunks
+        # Iterate over the audio in exact 128-sample chunks
         for i in range(0, noisy_wav.shape[-1], chunk_size):
             # feed() expects (Channels, Time) -> (1, chunk_size)
             chunk = noisy_wav[:, i:i+chunk_size]
@@ -146,7 +158,7 @@ def main():
         print("Your overlap-add caches and Mamba state passing are flawless.")
         print("You are officially cleared to begin writing the ggml dump scripts.")
     else:
-        print("\n❌ FAILURE: State caching bug detected in _enhance_frame_step.")
+        print("\n❌ FAILURE: State caching bug detected in _cached_streaming_forward.")
         print("The arrays diverge. Do not export to C++ until this MSE is 0.0.")
 
 if __name__ == "__main__":

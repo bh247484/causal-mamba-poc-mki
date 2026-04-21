@@ -1,3 +1,5 @@
+# Outdated...
+
 # EdgeAudioUSE (Universal Speech Enhancer)
 
 **EdgeAudioUSE** is a causal, stateful 1D Convolutional U-Net fused with a State Space Model (Mamba) bottleneck. 
@@ -32,13 +34,13 @@ The network acts as an autoencoder, compressing raw audio into a dense latent sp
 
 Standard PyTorch is stateless. Passing a 10-second audio file through a U-Net calculates the receptive fields for the entire file at once. In live VoIP, audio arrives in continuous 10-millisecond buffers. If fed naively into a stateless U-Net, the convolutional layers and Mamba blocks will drop their acoustic memory at every boundary, causing severe audio stuttering.
 
-This model solves this via the `StreamingInferenceMixin` and the `_enhance_frame_step` method, which emulate the exact memory allocation strategy required for the C++ SDK.
+This model solves this via the `StreamingInferenceMixin` and the `_cached_streaming_forward` method, which emulate the exact memory allocation strategy required for the C++ SDK.
 
-### The Tensor Flow (`_enhance_frame_step`)
+### The Tensor Flow (`_cached_streaming_forward`)
 
 When operating in live inference mode (`model.feed()`), the model bypasses the standard `forward()` pass and executes a custom execution loop to maintain temporal continuity:
 
-1. **Overlap-Save (Encoder):** Strided convolutions require context from the past. The engine retrieves the trailing edge of the previous 10ms frame from `self.encoder_decoder_state`, concatenates it to the front of the current tensor, aligns the sliding window, and saves the new trailing edge for the next callback.
+1. **Overlap-Save (Encoder):** Strided convolutions require context from the past. The engine retrieves the trailing edge of the previous 10ms frame from `self.encoder_cache` and `self.decoder_cache`, concatenates it to the front of the current tensor, aligns the sliding window, and saves the new trailing edge for the next callback.
 2. **State Relay (Mamba):** The compressed latent tensor is passed to the Mamba blocks along with `self.inference_params`. Mamba retrieves the historical hidden state ($h_t$), updates its memory using the new frame, and overwrites the cache so the room context persists across boundaries.
 3. **Overlap-Add (Decoder):** Transposed convolutions "splat" data, meaning the output of Frame A mathematically bleeds into the time-domain of Frame B. The engine slices off this excess trailing edge, saves it, and mathematically adds it to the leading edge of the next frame to prevent clicks and pops.
 

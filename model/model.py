@@ -5,7 +5,7 @@ import pytorch_lightning as pl
 import auraloss
 from modules.unified_mamba_block import UnifiedMambaBlock
 from utils.init import weight_scaling_init
-from utils.padding import pad_signal, get_valid_length
+from utils.padding import pad_signal
 from utils.streaming import StreamingInferenceMixin
 from layers import EncoderBlock, DecoderBlock
 from typing import cast
@@ -134,10 +134,10 @@ class EdgeAudioUSE(pl.LightningModule, StreamingInferenceMixin):
         # Initialize the buffers and state tracking variables required 
         # by the StreamingInferenceMixin.
         # ---------------------------------------------------------
-
-        # Calculate the required frame length for the streaming buffer
-        self.frame_length = get_valid_length(1, self.num_encoder_layers, self.kernel_size, self.stride)
         self.init_streaming_state(channels_input=1)
+        # A causal U-Net must process a sequence that is a perfect multiple 
+        # of its total stride (2^6 = 64). 128 samples = 8ms latency.
+        self.frame_length = 128
 
         # ---------------------------------------------------------
         # The Gradient Stabilizer (init.py)
@@ -148,17 +148,11 @@ class EdgeAudioUSE(pl.LightningModule, StreamingInferenceMixin):
             if isinstance(module, (nn.Conv1d, nn.ConvTranspose1d)):
                 weight_scaling_init(module)
 
-    def forward(self, x):
-        # ---------------------------------------------------------
-        # Macro-Padding (padding.py)
-        # Prevent fractional truncation. If the input length isn't a perfect multiple 
-        # of the total stride, the U-Net will delete trailing audio samples. 
-        # We pass the U-Net's geometric parameters (layers, kernel, stride) to `pad_signal` 
-        # so it can calculate the exact number of dummy zeros needed on the right side 
-        # to guarantee the audio survives the bottleneck intact.
-        # ---------------------------------------------------------
+    def forward(self, x, mamba_streaming_parity=False):
         original_length = x.shape[-1]
-        x = pad_signal(x, self.num_encoder_layers, self.kernel_size, self.stride)
+        # Calculate total stride (e.g., 2^6 = 64)
+        total_stride = self.stride ** self.num_encoder_layers
+        x = pad_signal(x, total_stride)
 
         skips = []
         
@@ -173,7 +167,7 @@ class EdgeAudioUSE(pl.LightningModule, StreamingInferenceMixin):
         x = x.permute(0, 2, 1) 
         
         for mamba in self.mamba_blocks:
-            x = mamba(x)
+            x = mamba(x, mamba_streaming_parity=mamba_streaming_parity)
         
         # Swapping back to (Batch, Channels, Time)
         x = x.permute(0, 2, 1) 
@@ -188,7 +182,7 @@ class EdgeAudioUSE(pl.LightningModule, StreamingInferenceMixin):
 
         # Slice off the mathematical padding before returning the final audio
         return x[..., :original_length]
-
+    
     """
     The Streaming Step (streaming.py)
     Processes a single, perfectly sized frame of audio during live edge inference.
@@ -204,7 +198,7 @@ class EdgeAudioUSE(pl.LightningModule, StreamingInferenceMixin):
     Tensor Flow & Architecture:
     1. The Encoder (Overlap-Save): 
         Strided convolutions require context from the past. For each encoder layer, 
-        we retrieve the trailing edge of the previous frame from `self.encoder_decoder_state`, 
+        we retrieve the trailing edge of the previous frame from `self.encoder_cache`, 
         concatenate it to the front of the current tensor, and calculate the exact offset 
         needed to align the sliding window. We then save the new trailing edge for the next frame.
         
@@ -217,7 +211,7 @@ class EdgeAudioUSE(pl.LightningModule, StreamingInferenceMixin):
     3. The Decoder (Overlap-Add):
         Transposed convolutions "splat" data, meaning the mathematical output of Frame A 
         physically bleeds into the time-domain of Frame B. For each decoder layer, we slice 
-        off this excess trailing edge, save it to the cache, and mathematically add the 
+        off this excess trailing edge, save it to `self.decoder_cache`, and mathematically add the 
         cached edge from the previous frame to the leading edge of the current frame.
         
     Args:
@@ -227,92 +221,96 @@ class EdgeAudioUSE(pl.LightningModule, StreamingInferenceMixin):
     Returns:
         torch.Tensor: A fully enhanced audio frame ready to be dispatched to the speaker.
     """
-    def _enhance_frame_step(self, frame):
+    def _cached_streaming_forward(self, frame):
         """
-        Processes a single valid frame during streaming inference.
-        Unlike `forward()`, this method caches the convolutional overlaps
-        and Mamba hidden states in `self.encoder_decoder_state` to maintain
-        temporal continuity between frames.
+        Processes a single valid frame (e.g., 10ms) during real-time edge inference.
+        Relies on `StreamingInferenceMixin` to inject temporal memory into the graph.
         """
         x = frame.unsqueeze(1) if frame.dim() == 2 else frame
         skips = []
         
-        # 1. The Encoder (With Overlap Caching)
-        total_stride_tracker = self.stride ** self.num_encoder_layers
-        for i, encode in enumerate(self.encoder):
-            total_stride_tracker //= self.stride
-            length = x.shape[-1]
+        # Calculate the length of the overlap
+        # This is also the cache size
+        overlap_len = self.kernel_size - self.stride
+        
+        # ---------------------------------------------------------
+        # 1. The Encoder (Overlap-Save / Causal Input Caching)
+        # ---------------------------------------------------------
+        for i, _block in enumerate(self.encoder):
+            # Tell Pylance this is an EncoderBlock
+            block = cast(EncoderBlock, _block)
+
+            # Retrieve the cached, trailing edge of the PREVIOUS frame's input
+            prev_input = self.encoder_cache.get(f"layer_{i}", None)
             
-            # Retrieve the cached overlap from the previous frame
-            prev_state = self.encoder_decoder_state.get(f"enc{i}", None)
+            if prev_input is not None:
+                # Prepend the cached past input to the current input
+                x_padded = torch.cat([prev_input, x], dim=-1)
+            else:
+                # First frame: pad with zeros (silence)
+                x_padded = F.pad(x, (overlap_len, 0))
+                
+            # Cache the trailing edge of the CURRENT input for the NEXT callback frame
+            self.encoder_cache[f"layer_{i}"] = x_padded[..., -overlap_len:]
             
-            if prev_state is not None:
-                # Calculate how much of the current frame we need to chop off 
-                # because it was already processed in the previous frame's lookahead
-                offset = length - self.kernel_size - self.stride * ((length - self.kernel_size) // self.stride - prev_state.shape[-1])
-                x = x[..., offset:]
+            # Call the raw nn.Conv1d (conv.conv) primitive directly to bypass F.pad
+            # We want auto padding for training, but not here for inference
+            x = block.conv.conv(x_padded)
+            x = block.activation(x)
+            x = block.conv1x1(x)
 
-            # Process the block
-            x = encode(x)
-
-            if prev_state is not None:
-                # Stitch the cached overlap to the front of the new tensor
-                x = torch.cat([prev_state, x], dim=-1)
-
-            # Save the trailing edge of this block's output for the NEXT frame
-            self.encoder_decoder_state[f"enc{i}"] = x[..., total_stride_tracker:]
             skips.append(x)
 
-        # 2. The Mamba Bottleneck (With State Passing)
-        x = self.proj_in(x)
-        x = x.permute(0, 2, 1) 
+        # ---------------------------------------------------------
+        # 2. The Mamba Bottleneck (Recurrent State Passing)
+        # ---------------------------------------------------------
+        x = self.proj_in(x).permute(0, 2, 1) 
         
         # Pass `self.inference_params` into the Mamba blocks so they can 
         # read the previous state and write the new state
-        for mamba in self.mamba_blocks:
-            x = mamba(x, inference_params=self.inference_params) 
-            
+        for i, mamba in enumerate(self.mamba_blocks):
+            # 1. Create a private memory namespace for this specific layer
+            layer_key = f"mamba_layer_{i}"
+            if layer_key not in self.inference_params:
+                self.inference_params[layer_key] = {}
+                
+            # 2. Pass ONLY that private dictionary to the block
+            x = mamba(x, inference_params=self.inference_params[layer_key])
+
         x = x.permute(0, 2, 1) 
         x = self.proj_out(x)
 
-        # 3. The Decoder (With Overlap-Add)
-        skips = skips[::-1]
+        # ---------------------------------------------------------
+        # 3. The Decoder (Overlap-Add Splatting)
+        # ---------------------------------------------------------
         for i, _block in enumerate(self.decoder):
-            # Forcibly tell Pylance: "This generic module is actually a DecoderBlock"
+            # Tell Pylance this is an DecoderBlock
             block = cast(DecoderBlock, _block)
-            skip = skips[i][..., -x.shape[-1]:]
-            # Apply the learnable gain for this specific layer here as well
+            
+            # FILO Stack: Pop the deepest skip connection directly off the list
+            skip = skips.pop()[..., -x.shape[-1]:]
+            
+            # Apply the learned skip dampener parameter
             x = x + (skip * self.skip_gains[i])
             
-            # The decoder block consists of [1x1 Conv, ReLU, TransposedConv, ReLU]
-            # We step through them manually to handle the state caching
             x = block.conv1x1(x)
             x = block.relu1(x)
-            # Call the raw conv_t module directly to bypass the Adjustable auto-trimmer
-            # or else we'll double trim the overlap.
+            # Call the raw inner nn.ConvTranspose1d (trans_conv.conv_t) block here to bypass padding
+            # We want auto padding for training, but not here for inference
             x = block.trans_conv.conv_t(x)
             
-            # Get the previous overlap
-            prev_state = self.encoder_decoder_state.get(f"dec{i}", None)
-
-            overlap_len = self.kernel_size - self.stride
-
-            # Safely handle the bias to satisfy Pylance (and prevent edge-case crashes)
-            bias_val = 0
-            if block.trans_conv.conv_t.bias is not None:
-                bias_val = block.trans_conv.conv_t.bias.view(-1, 1)
+            # 3A. State Stitching
+            prev_state = self.decoder_cache.get(f"layer_{i}", None)
+            if prev_state is not None:
+                x[..., :overlap_len] += prev_state
+                
+            # 3B. Bias Adjustment & State Saving
+            bias_val = block.trans_conv.conv_t.bias.view(-1, 1) if block.trans_conv.conv_t.bias is not None else 0
+            self.decoder_cache[f"layer_{i}"] = x[..., -overlap_len:] - bias_val
             
-            # Save the current trailing edge for the next frame
-            # And subtract bias so we don't count it twice across two frames
-            self.encoder_decoder_state[f"dec{i}"] = x[..., -overlap_len:] - bias_val
-            
-            # Trim the trailing edge off the current frame
+            # 3C. Truncate the future bleed from the current frame
             x = x[..., :-overlap_len]
             
-            if prev_state is not None:
-                # Add the previous frame's overlap to the current frame's leading edge
-                x[..., :overlap_len] += prev_state
-
             if not block.is_last:
                 x = F.relu(x)
 
