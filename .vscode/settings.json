@@ -2,5 +2,6 @@
   "python.defaultInterpreterPath": "${workspaceFolder}/model/.venv/bin/python",
   "python.analysis.extraPaths": [
     "${workspaceFolder}/model"
-  ]
+  ],
+  "cmake.sourceDirectory": "/Users/bh/Documents/personal-code/ml/causal-mamba-poc/inference/ggml/src/ggml-blas"
 }
