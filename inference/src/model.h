@@ -18,6 +18,7 @@ struct EdgeAudioModel {
 
     // Hyperparameters
     int num_encoder_layers = 0;
+    int num_mamba_blocks = 0;
     int d_model = 0;
     int kernel_size = 0;
     int stride = 0;

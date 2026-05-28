@@ -11,6 +11,7 @@ void inspect_model(const EdgeAudioModel& model) {
     printf("========================================================\n");
     printf("Architecture (Header Promised):\n");
     printf("  Encoder Layers    : %d\n", model.num_encoder_layers);
+    printf("  Mamba Blocks      : %d\n", model.num_mamba_blocks);
     printf("  d_model           : %d\n", model.d_model);
     printf("  kernel_size       : %d\n", model.kernel_size);
     printf("  stride            : %d\n", model.stride);
@@ -103,6 +104,7 @@ bool load_model(const std::string& bin_path, EdgeAudioModel& model) {
 
     // 2. Read Hyperparameters
     fread(&model.num_encoder_layers, sizeof(int), 1, bin_file);
+    fread(&model.num_mamba_blocks, sizeof(int), 1, bin_file);
     fread(&model.d_model, sizeof(int), 1, bin_file);
     fread(&model.kernel_size, sizeof(int), 1, bin_file);
     fread(&model.stride, sizeof(int), 1, bin_file);
@@ -111,8 +113,17 @@ bool load_model(const std::string& bin_path, EdgeAudioModel& model) {
     fread(&model.model_dtype_bytes, sizeof(int), 1, bin_file);
 
     printf(
-      "[INFO] Config loaded: layers=%d, d_model=%d, kernel=%d, stride=%d, total_float_bytes=%d, tensor_count=%d, model_dtype_bytes=%d\n", 
+      "[INFO] Config loaded: "
+      "num_encoder_layers=%d, "
+      "num_mamba_blocks=%d, "
+      "d_model=%d, "
+      "kernel=%d, "
+      "stride=%d, "
+      "total_float_bytes=%d, "
+      "tensor_count=%d, "
+      "model_dtype_bytes=%d\n", 
       model.num_encoder_layers,
+      model.num_mamba_blocks,
       model.d_model,
       model.kernel_size,
       model.stride,
