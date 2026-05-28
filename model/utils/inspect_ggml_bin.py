@@ -15,14 +15,25 @@ def main():
         print(f"Magic Number: {hex(magic)} (Expected: 0x67676d6c)")
         
         # Read Hyperparameters
-        layers = struct.unpack("i", f.read(4))[0]
+        num_encoder_layers = struct.unpack("i", f.read(4))[0]
+        num_mamba_blocks = struct.unpack("i", f.read(4))[0]
         d_model = struct.unpack("i", f.read(4))[0]
         kernel = struct.unpack("i", f.read(4))[0]
         stride = struct.unpack("i", f.read(4))[0]
         total_float_bytes = struct.unpack("i", f.read(4))[0]
         tensor_count = struct.unpack("i", f.read(4))[0]
         model_dtype_bytes = struct.unpack("i", f.read(4))[0]
-        print(f"Config: layers={layers}, d_model={d_model}, kernel={kernel}, stride={stride}, total_float_bytes={total_float_bytes}, tensor_count={tensor_count}, model_dtype_bytes={model_dtype_bytes}\n")
+        print(
+            "Config: "
+            f"num_encoder_layers={num_encoder_layers}, "
+            f"num_mamba_blocks={num_mamba_blocks}, "
+            f"d_model={d_model}, "
+            f"kernel={kernel}, "
+            f"stride={stride}, "
+            f"total_float_bytes={total_float_bytes}, "
+            f"tensor_count={tensor_count}, "
+            f"model_dtype_bytes={model_dtype_bytes}\n"
+          )
         
         print(f"{'Tensor Name'.ljust(40)} | {'Shape'.ljust(15)} | Elements")
         print("-" * 75)

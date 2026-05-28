@@ -84,6 +84,7 @@ def main():
         # C++ needs to know how much memory to allocate before reading the weights.
         # We pack these as standard 32-bit integers ('i').
         f.write(struct.pack("i", model.num_encoder_layers))
+        f.write(struct.pack("i", len(model.mamba_blocks))) # num_mamba_blocks
         f.write(struct.pack("i", 512)) # d_model
         f.write(struct.pack("i", model.kernel_size))
         f.write(struct.pack("i", model.stride))
@@ -91,7 +92,17 @@ def main():
         f.write(struct.pack("i", tensor_count))
         f.write(struct.pack("i", model_dtype_bytes))
         
-        print(f"Header written: layers={model.num_encoder_layers}, d_model=512, kernel={model.kernel_size}, stride={model.stride}, total_float_bytes={total_float_bytes}, tensor_count={tensor_count}, model_dtype_bytes={model_dtype_bytes}")
+        print(
+            "Header written: "
+            f"num_encoder_layers={model.num_encoder_layers}, "
+            f"num_mamba_blocks={len(model.mamba_blocks)}, "
+            "d_model=512, "
+            f"kernel={model.kernel_size}, "
+            f"stride={model.stride}, "
+            f"total_float_bytes={total_float_bytes}, "
+            f"tensor_count={tensor_count}, "
+            f"model_dtype_bytes={model_dtype_bytes}\n"
+        )
 
         # ---------------------------------------------------------
         # TENSOR BLOCK
