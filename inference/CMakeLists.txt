@@ -24,6 +24,7 @@ add_executable(edge_audio)
 target_sources(edge_audio PRIVATE
     src/main.cpp
     src/model.cpp
+    src/state.cpp
 )
 
 # 4. Link GGML and include directories

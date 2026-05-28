@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include "model.h"
+#include "state.h"
 
 // A clean struct to hold our runtime configuration.
 // As we add features (e.g., chunk size, audio devices), they go here.
@@ -47,8 +48,18 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // Initialize the temporal memory arena
+    AudioStateCache state;
+    if (!state.init(model)) {
+        std::cerr << "[ERROR] Failed to initialize state caches. Exiting.\n";
+        free_model(model);
+        return 1;
+    }
+
     // Debug print of model.
     inspect_model(model);
+    // Debug print of state cache.
+    state.inspect();
 
     // 3. Threading & Execution Lifecycle
     if (config.streaming_mode) {
