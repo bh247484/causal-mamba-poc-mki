@@ -4,6 +4,7 @@
 #include <vector>
 #include "model.h"
 #include "state.h"
+#include "graph.h"
 
 // A clean struct to hold our runtime configuration.
 // As we add features (e.g., chunk size, audio devices), they go here.
@@ -55,6 +56,18 @@ int main(int argc, char** argv) {
         free_model(model);
         return 1;
     }
+
+    // Placeholder dummy audio buffers to test compilation.
+    float input_audio[128] = {0.0f};
+    float output_audio[128] = {0.0f};
+
+    process_audio_frame(
+        model,
+        state,
+        input_audio,
+        output_audio,
+        128
+    );
 
     // Debug print of model.
     inspect_model(model);

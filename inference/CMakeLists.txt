@@ -25,6 +25,7 @@ target_sources(edge_audio PRIVATE
     src/main.cpp
     src/model.cpp
     src/state.cpp
+    src/graph.cpp
 )
 
 # 4. Link GGML and include directories
