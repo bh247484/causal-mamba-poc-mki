@@ -14,6 +14,7 @@ struct GraphContext {
     std::vector<struct ggml_tensor*>& enforced_deps;
     std::vector<struct ggml_tensor*>& skips;
     std::vector<struct ggml_tensor*>& encoder_padded_tensors;
+    std::vector<struct ggml_tensor*>& mamba_padded_tensors;
 };
 
 // Safely reshapes a 1D bias tensor to [1, Channels] to broadcast across Time
@@ -98,6 +99,84 @@ struct ggml_tensor* execute_encoder_layer(GraphContext& gctx, struct ggml_tensor
     return x;
 }
 
+// Applies the depthwise 1D Convolution for Branch 1 of the Mamba Block
+struct ggml_tensor* apply_mamba_conv1d(GraphContext& gctx, struct ggml_tensor* branch_1, int layer_idx) {
+    std::string prefix = "mamba_blocks." + std::to_string(layer_idx) + ".block.layers.0.mixer.";
+    struct ggml_tensor* conv_w = gctx.model.tensors.at(prefix + "conv1d.weight");
+    struct ggml_tensor* conv_b = gctx.model.tensors.at(prefix + "conv1d.bias");
+
+    // branch_1 is naturally [Channels, Time]
+    int channels = branch_1->ne[0];      // 1024
+    int current_time_len = branch_1->ne[1];
+
+    // ========================================================================
+    // 1. PREPARE THE WEIGHTS
+    // PyTorch exports depthwise weights as [4, 1, 1024].
+    // We reshape to [4, 1024], transpose, and force it to be physically contiguous
+    // in RAM so it becomes a perfect [1024, 4] matrix.
+    // ========================================================================
+    struct ggml_tensor* w_2d = ggml_reshape_2d(gctx.ctx, conv_w, 4, channels);
+    struct ggml_tensor* w_cont = ggml_cont(gctx.ctx, ggml_transpose(gctx.ctx, w_2d));
+
+    // ========================================================================
+    // 2. OVERLAP-SAVE CACHE
+    // ========================================================================
+    int overlap_len = 3; // kernel=4 causal means 3 ticks of history
+    int padded_time = overlap_len + current_time_len;
+    
+    // Allocate [1024, padded_time]
+    struct ggml_tensor* x_padded = ggml_new_tensor_2d(gctx.ctx, GGML_TYPE_F32, channels, padded_time);
+    gctx.mamba_padded_tensors.push_back(x_padded);
+
+    // Load Cache [1024, 3]
+    struct ggml_tensor* cache_tensor = ggml_new_tensor_2d(gctx.ctx, GGML_TYPE_F32, channels, overlap_len);
+    memcpy(cache_tensor->data, gctx.state.mamba_states[layer_idx].conv_state.data(), channels * overlap_len * sizeof(float));
+
+    // Copy cache to the front (Offset 0 on the Time/Y-axis)
+    struct ggml_tensor* view_front = ggml_view_2d(gctx.ctx, x_padded, channels, overlap_len, x_padded->nb[1], 0);
+    gctx.enforced_deps.push_back(ggml_cpy(gctx.ctx, cache_tensor, view_front));
+
+    // Copy audio to the back (Offset by overlap_len on the Time/Y-axis)
+    size_t offset_bytes = overlap_len * x_padded->nb[1];
+    struct ggml_tensor* view_back = ggml_view_2d(gctx.ctx, x_padded, channels, current_time_len, x_padded->nb[1], offset_bytes);
+    gctx.enforced_deps.push_back(ggml_cpy(gctx.ctx, branch_1, view_back));
+
+    // ========================================================================
+    // 3. THE DEPTHWISE CONVOLUTION (Manual SIMD Math)
+    // y[t] = x[t-3]*w0 + x[t-2]*w1 + x[t-1]*w2 + x[t]*w3
+    // ========================================================================
+    struct ggml_tensor* y = NULL;
+
+    for (int k = 0; k < 4; k++) {
+        // Slice the weight for this kernel index -> [1024, 1]
+        size_t w_offset = k * w_cont->nb[1];
+        struct ggml_tensor* w_k = ggml_view_2d(gctx.ctx, w_cont, channels, 1, w_cont->nb[1], w_offset);
+
+        // Slice the audio for this time offset -> [1024, current_time_len]
+        size_t t_offset = k * x_padded->nb[1];
+        struct ggml_tensor* x_k = ggml_view_2d(gctx.ctx, x_padded, channels, current_time_len, x_padded->nb[1], t_offset);
+
+        // Multiply element-wise (GGML broadcasts the [1024, 1] weight across the Time columns automatically)
+        struct ggml_tensor* mul = ggml_mul(gctx.ctx, x_k, w_k);
+
+        // Accumulate
+        if (y == NULL) {
+            y = mul;
+        } else {
+            y = ggml_add(gctx.ctx, y, mul);
+        }
+    }
+
+    // 4. Add Bias [1024, 1] (Broadcasts across Time)
+    struct ggml_tensor* b_reshaped = ggml_reshape_2d(gctx.ctx, conv_b, channels, 1);
+    y = ggml_add(gctx.ctx, y, b_reshaped);
+
+    // 5. SiLU Activation
+    y = ggml_silu(gctx.ctx, y);
+
+    return y; 
+}
+
 // Abstract a single Mamba Block pass
 struct ggml_tensor* execute_mamba_block(GraphContext& gctx, struct ggml_tensor* x, int layer_idx, int current_time_len) {
     std::string prefix = "mamba_blocks." + std::to_string(layer_idx) + ".block.layers.0.";
@@ -125,7 +204,24 @@ struct ggml_tensor* execute_mamba_block(GraphContext& gctx, struct ggml_tensor* 
     printf("[DEBUG] -----------------------------------\n");
 
     // 2. In Projection
-    struct ggml_tensor* x_in = ggml_mul_mat(gctx.ctx, in_proj_w, x_norm);
+    struct ggml_tensor* x_proj = ggml_mul_mat(gctx.ctx, in_proj_w, x_norm);
+
+    // ========================================================================
+    // THE SPLIT (Branch 1 and Branch 2)
+    // ========================================================================
+    // x_proj is [2048, Time]. We slice it into two [1024, Time] branches.
+    int d_inner = x_proj->ne[0] / 2;
+
+    // Branch 1 (The Data) - Bottom 1024 channels
+    struct ggml_tensor* branch_1 = ggml_view_2d(gctx.ctx, x_proj, d_inner, current_time_len, x_proj->nb[1], 0);
+    
+    // Branch 2 (The Gate) - Top 1024 channels (Offset down the X-axis of channels)
+    // We step forward by d_inner * nb[0] (which is just d_inner * sizeof(float))
+    size_t branch_2_offset = d_inner * x_proj->nb[0];
+    struct ggml_tensor* branch_2 = ggml_view_2d(gctx.ctx, x_proj, d_inner, current_time_len, x_proj->nb[1], branch_2_offset);
+
+    // Pass Branch 1 through the Temporal Convolution
+    struct ggml_tensor* x_in = apply_mamba_conv1d(gctx, branch_1, layer_idx);
 
     // ========================================================================
     // THE TEMPORAL RNN LOOP (With Pre-allocated Reassembly)
@@ -154,23 +250,21 @@ struct ggml_tensor* execute_mamba_block(GraphContext& gctx, struct ggml_tensor* 
     }
 
     // ========================================================================
-    // 3. OUT PROJECTION & RESIDUAL SKIP CONNECTION
+    // GATING & OUT PROJECTION & RESIDUAL SKIP CONNECTION
     // ========================================================================
-    // Load the output projection weight
+    // A. Activate the Gate (Branch 2)
+    struct ggml_tensor* gate = ggml_silu(gctx.ctx, branch_2);
+
+    // B. Element-wise multiply the Memory (Branch 1) by the Gate (Branch 2)
+    // Both are perfectly aligned as [1024, Time]
+    struct ggml_tensor* gated_output = ggml_mul(gctx.ctx, out_assembled, gate);
+
+    // C. Output Projection: Project [1024, Time] back down to [512, Time]
     struct ggml_tensor* out_proj_w = gctx.model.tensors.at(prefix + "mixer.out_proj.weight");
+    struct ggml_tensor* x_out = ggml_mul_mat(gctx.ctx, out_proj_w, gated_output);
 
-    // out_assembled is [2048, 2]. We must split it into two 1024-channel branches.
-    int d_inner = out_assembled->ne[0] / 2; // 1024 channels
-
-    // For this structural test, we will just slice the first 1024 channels (Branch 1).
-    // (When we write the real math, Branch 1 and Branch 2 will be multiplied together here).
-    struct ggml_tensor* branch_1 = ggml_view_2d(gctx.ctx, out_assembled, d_inner, current_time_len, out_assembled->nb[1], 0);
-
-    // Project [1024, 2] back down to [512, 2] using out_proj_w
-    struct ggml_tensor* x_out = ggml_mul_mat(gctx.ctx, out_proj_w, branch_1);
-
-    // Standard Deep Learning Residual Skip Connection: 
-    // Add the original 512-channel input of this block (x) to the 512-channel output
+    // D. Standard Deep Learning Residual Skip Connection 
+    // Add the original 512-channel input of this block (x) to the 512-channel output (x_out)
     x_out = ggml_add(gctx.ctx, x_out, x);
     
     return x_out;
@@ -205,11 +299,20 @@ bool process_audio_frame(
     std::vector<struct ggml_tensor*> enforced_deps;
     // We save the skip connections for the Decoder (Phase 3)
     std::vector<struct ggml_tensor*> skips;
-      // We save the padded input tensors so we can crop their tails at the very end
+    // We save the padded input tensors so we can crop their tails at the very end
     std::vector<struct ggml_tensor*> encoder_padded_tensors;
+    std::vector<struct ggml_tensor*> mamba_padded_tensors;
 
     // Package the references cleanly
-    GraphContext gctx = { ctx, model, state, enforced_deps, skips, encoder_padded_tensors };
+    GraphContext gctx = {
+        ctx,
+        model,
+        state,
+        enforced_deps,
+        skips,
+        encoder_padded_tensors,
+        mamba_padded_tensors
+    };
 
     // ========================================================================
     // 2. THE INPUT TENSOR
