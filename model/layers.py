@@ -30,20 +30,20 @@ class DecoderBlock(nn.Module):
         super().__init__()
         # Define layers explicitly instead of using nn.Sequential
         self.conv1x1 = nn.Conv1d(in_channels, in_channels, kernel_size=1)
-        self.relu1 = nn.ReLU()
+        self.silu = nn.SiLU()
         self.trans_conv = AdjustableConvTranspose1d(in_channels, out_channels, kernel_size, stride, lookahead)
         self.is_last = is_last
 
     def forward(self, x):
         # Manually route the signal through the layers
         x = self.conv1x1(x)
-        x = self.relu1(x)
+        x = self.silu(x)
         out = self.trans_conv(x)
         
         # We need full bidirectional -1.0 to 1.0 spectrum for audio reproduction
         # Applying relu to final layer will chop off all negative values, so we skip it
         if not self.is_last:
-            out = F.relu(out)
+            out = F.silu(out)
         return out
     
 # Lifted from CleanUMamba codebase

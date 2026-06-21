@@ -294,7 +294,7 @@ class EdgeAudioUSE(pl.LightningModule, StreamingInferenceMixin):
             x = x + (skip * self.skip_gains[i])
             
             x = block.conv1x1(x)
-            x = block.relu1(x)
+            x = block.silu(x)
             # Call the raw inner nn.ConvTranspose1d (trans_conv.conv_t) block here to bypass padding
             # We want auto padding for training, but not here for inference
             x = block.trans_conv.conv_t(x)
