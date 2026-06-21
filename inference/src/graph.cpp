@@ -15,6 +15,7 @@ struct GraphContext {
     std::vector<struct ggml_tensor*>& skips;
     std::vector<struct ggml_tensor*>& encoder_padded_tensors;
     std::vector<struct ggml_tensor*>& mamba_padded_tensors;
+    std::vector<struct ggml_tensor*>& mamba_final_ssm_states;
 };
 
 // Safely reshapes a 1D bias tensor to [1, Channels] to broadcast across Time
@@ -177,6 +178,106 @@ struct ggml_tensor* apply_mamba_conv1d(GraphContext& gctx, struct ggml_tensor* b
     return y; 
 }
 
+// Executes a single millisecond (tick) of the State Space Model recurrence.
+// Returns the output y_t, and passes back the updated hidden state h_t.
+struct ggml_tensor* step_ssm_recurrence(
+    GraphContext& gctx, 
+    struct ggml_tensor* x_t, 
+    struct ggml_tensor* prev_h, 
+    std::string prefix,
+    struct ggml_tensor** next_h // Pointer so we can return the updated state
+) {
+    struct ggml_context* ctx = gctx.ctx;
+    
+    // Load static weights
+    struct ggml_tensor* x_proj_w  = gctx.model.tensors.at(prefix + "mixer.x_proj.weight");
+    struct ggml_tensor* dt_proj_w = gctx.model.tensors.at(prefix + "mixer.dt_proj.weight");
+    struct ggml_tensor* dt_proj_b = gctx.model.tensors.at(prefix + "mixer.dt_proj.bias");
+    struct ggml_tensor* A_log     = gctx.model.tensors.at(prefix + "mixer.A_log");
+    struct ggml_tensor* D         = gctx.model.tensors.at(prefix + "mixer.D");
+
+    int d_inner = x_t->ne[0];    // 1024
+    int d_state = A_log->ne[0];  // 16
+    int dt_rank = dt_proj_w->ne[0]; // 32
+
+    // ========================================================================
+    // 1. THE DYNAMIC PROJECTIONS (Generate Delta, B, and C)
+    // ========================================================================
+    // x_proj_w is [64, 1024]. x_t is [1024, 1]. Output is [64, 1].
+    struct ggml_tensor* x_proj_out = ggml_mul_mat(ctx, x_proj_w, x_t);
+
+    // Slice the [64, 1] output into our three dynamic parameters using 1D byte offsets
+    struct ggml_tensor* dt_raw = ggml_view_1d(ctx, x_proj_out, dt_rank, 0);
+    struct ggml_tensor* B      = ggml_view_1d(ctx, x_proj_out, d_state, dt_rank * sizeof(float));
+    struct ggml_tensor* C      = ggml_view_1d(ctx, x_proj_out, d_state, (dt_rank + d_state) * sizeof(float));
+
+    // Project dt_raw [32, 1] -> dt [1024, 1], add bias, and apply Softplus
+    struct ggml_tensor* dt = ggml_mul_mat(ctx, dt_proj_w, dt_raw);
+    dt = ggml_add(ctx, dt, dt_proj_b);
+    struct ggml_tensor* dt_soft = ggml_softplus(ctx, dt);
+
+    // ========================================================================
+    // 2. DISCRETIZE THE PHYSICS (Calculate A_bar and B_bar)
+    // ========================================================================
+    // A_log is parameterized as log(A). The true A is -exp(A_log).
+    struct ggml_tensor* A_true = ggml_neg(ctx, ggml_exp(ctx, A_log)); // Shape: [16, 1024]
+
+    // To multiply dt [1024, 1] against A [16, 1024], we must reshape dt to [1, 1024] 
+    // and physically repeat (broadcast) it 16 times across the X-axis.
+    struct ggml_tensor* dt_reshaped = ggml_reshape_2d(ctx, dt_soft, 1, d_inner);
+    struct ggml_tensor* dt_repeated = ggml_repeat(ctx, dt_reshaped, A_true);
+    
+    // A_bar = exp(dt * A)
+    struct ggml_tensor* dt_A = ggml_mul(ctx, dt_repeated, A_true);
+    struct ggml_tensor* A_bar = ggml_exp(ctx, dt_A);
+
+    // Calculate B_bar_x = (dt * x_t) * B. (We combine x_t into B_bar for efficiency).
+    // dx = dt * x_t -> Shape [1024, 1]
+    struct ggml_tensor* dx = ggml_mul(ctx, dt_soft, x_t);
+    struct ggml_tensor* dx_reshaped = ggml_reshape_2d(ctx, dx, 1, d_inner);
+    struct ggml_tensor* dx_repeated = ggml_repeat(ctx, dx_reshaped, A_true); // Broadcast to [16, 1024]
+
+    // B is [16, 1]. We reshape to [16, 1] (just to be safe) and repeat to [16, 1024]
+    struct ggml_tensor* B_reshaped = ggml_reshape_2d(ctx, B, d_state, 1);
+    struct ggml_tensor* B_repeated = ggml_repeat(ctx, B_reshaped, A_true);
+
+    // B_bar_x = B * (dt * x_t)
+    struct ggml_tensor* B_bar_x = ggml_mul(ctx, B_repeated, dx_repeated);
+
+    // ========================================================================
+    // 3. THE RECURRENT MEMORY UPDATE
+    // ========================================================================
+    // h_t = (A_bar * prev_h) + B_bar_x
+    struct ggml_tensor* h_t = ggml_add(ctx, 
+                                       ggml_mul(ctx, A_bar, prev_h), 
+                                       B_bar_x);
+    
+    // Save a pointer to the new memory so the main loop can step forward
+    *next_h = h_t;
+
+    // ========================================================================
+    // 4. THE OUTPUT COMPRESSION
+    // ========================================================================
+    // y_t = h_t * C
+    struct ggml_tensor* C_reshaped = ggml_reshape_2d(ctx, C, d_state, 1);
+    struct ggml_tensor* C_repeated = ggml_repeat(ctx, C_reshaped, A_true); // [16, 1024]
+
+    struct ggml_tensor* h_C = ggml_mul(ctx, h_t, C_repeated);
+
+    // h_C is [16, 1024]. We must sum across the 16 state dimensions to compress 
+    // it back down to our 1024 channels. 
+    struct ggml_tensor* y_t = ggml_sum_rows(ctx, h_C); // Output is natively [1, 1024]
+
+    // Reshape back to [1024, 1] to match the input x_t geometry
+    y_t = ggml_reshape_2d(ctx, y_t, d_inner, 1);
+
+    // Add the static Skip Connection: y_t = y_t + (x_t * D)
+    struct ggml_tensor* D_reshaped = ggml_reshape_2d(ctx, D, d_inner, 1);
+    y_t = ggml_add(ctx, y_t, ggml_mul(ctx, x_t, D_reshaped));
+
+    return y_t;
+}
+
 // Abstract a single Mamba Block pass
 struct ggml_tensor* execute_mamba_block(GraphContext& gctx, struct ggml_tensor* x, int layer_idx, int current_time_len) {
     std::string prefix = "mamba_blocks." + std::to_string(layer_idx) + ".block.layers.0.";
@@ -229,25 +330,42 @@ struct ggml_tensor* execute_mamba_block(GraphContext& gctx, struct ggml_tensor* 
     // 1. Pre-allocate the massive contiguous destination tensor
     struct ggml_tensor* out_assembled = ggml_new_tensor_2d(gctx.ctx, GGML_TYPE_F32, x_in->ne[0], current_time_len);
     
-    // We must manually step through Time (t=0, then t=1) because Mamba is causal.
+    // 2. Load the initial hidden state (h_{t-1}) from our AudioStateCache
+    struct ggml_tensor* A_log = gctx.model.tensors.at(prefix + "mixer.A_log");
+    // Shape: [d_state, channels] -> [16, 1024]
+    int channels = x_in->ne[0];
+    int d_state = A_log->ne[0];; 
+    struct ggml_tensor* current_h = ggml_new_tensor_2d(gctx.ctx, GGML_TYPE_F32, d_state, channels);
+    memcpy(current_h->data, gctx.state.mamba_states[layer_idx].ssm_state.data(), d_state * channels * sizeof(float));
+
+    // 3. Step through Time sequentially
     for (int t = 0; t < current_time_len; t++) {
-        // A. Slice out a single tick of input time
+        // A. Slice out a single tick of input time -> [1024, 1]
         size_t in_offset = t * x_in->nb[1];
-        struct ggml_tensor* x_t = ggml_view_2d(gctx.ctx, x_in, x_in->ne[0], 1, x_in->nb[1], in_offset);
+        struct ggml_tensor* x_t = ggml_view_2d(gctx.ctx, x_in, channels, 1, x_in->nb[1], in_offset);
 
-        // ---------------------------------------------------------
-        // B. (Placeholder for the hardcore Mamba Math)
-        // GGML will spawn a new, disconnected memory node here for the output.
-        // ---------------------------------------------------------
-        struct ggml_tensor* y_t = x_t; 
+        // B. Step the State Space Model
+        struct ggml_tensor* next_h = NULL;
+        struct ggml_tensor* y_t = step_ssm_recurrence(gctx, x_t, current_h, prefix, &next_h);
 
-        // C. Create a stencil hovering over the correct slot in our pre-allocated tensor
+        // C. Update our rolling state pointer! 
+        // The next tick of time will now use the memory we just generated.
+        current_h = next_h;
+
+        // D. Create a stencil hovering over the correct slot in our pre-allocated tensor
         size_t out_offset = t * out_assembled->nb[1];
-        struct ggml_tensor* slot_view = ggml_view_2d(gctx.ctx, out_assembled, out_assembled->ne[0], 1, out_assembled->nb[1], out_offset);
+        struct ggml_tensor* slot_view = ggml_view_2d(gctx.ctx, out_assembled, channels, 1, out_assembled->nb[1], out_offset);
 
-        // D. Physically copy the math result from its island into the contiguous slot
+        // E. Physically copy the math result from its island into the contiguous slot
         gctx.enforced_deps.push_back(ggml_cpy(gctx.ctx, y_t, slot_view));
     }
+
+    // 4. Save the final hidden state of this audio chunk
+    // current_h now points to the memory state at t = current_time_len.
+    // We force GGML to compute it, and we save the pointer so we can extract 
+    // the floats back into our AudioStateCache during Phase 3.
+    gctx.enforced_deps.push_back(current_h);
+    gctx.mamba_final_ssm_states.push_back(current_h);
 
     // ========================================================================
     // GATING & OUT PROJECTION & RESIDUAL SKIP CONNECTION
@@ -281,14 +399,14 @@ bool process_audio_frame(
     // ========================================================================
     // 1. THE COMPUTE ARENA
     // ========================================================================
-    // Allocate 16MB for the intermediate math. In a fully optimized v2, 
+    // Allocate 32mb for the intermediate math. In a fully optimized v2, 
     // we would allocate this once at startup and reuse it. For v1, allocating
     // a single block per frame is perfectly fast enough for edge real-time.
     // We'll also want to run a test eventually to determine the _actual_ amount of 
-    // memory used by the graph and the update our hard coded 16MB amount.
-    // 16MB provides reasonable headroom for testing for now though.
+    // memory used by the graph and the update our hard coded 32MB amount.
+    // 32MB provides reasonable headroom for testing for now though.
     struct ggml_init_params params = {
-        .mem_size   = 16 * 1024 * 1024,
+        .mem_size   = 32 * 1024 * 1024, // 32 MB - Revisit this
         .mem_buffer = NULL,
         .no_alloc   = false
     };
@@ -302,6 +420,7 @@ bool process_audio_frame(
     // We save the padded input tensors so we can crop their tails at the very end
     std::vector<struct ggml_tensor*> encoder_padded_tensors;
     std::vector<struct ggml_tensor*> mamba_padded_tensors;
+    std::vector<struct ggml_tensor*> mamba_final_ssm_states;
 
     // Package the references cleanly
     GraphContext gctx = {
@@ -311,7 +430,8 @@ bool process_audio_frame(
         enforced_deps,
         skips,
         encoder_padded_tensors,
-        mamba_padded_tensors
+        mamba_padded_tensors,
+        mamba_final_ssm_states
     };
 
     // ========================================================================
