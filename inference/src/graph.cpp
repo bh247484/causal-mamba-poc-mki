@@ -16,6 +16,7 @@ struct GraphContext {
     std::vector<struct ggml_tensor*>& encoder_padded_tensors;
     std::vector<struct ggml_tensor*>& mamba_padded_tensors;
     std::vector<struct ggml_tensor*>& mamba_final_ssm_states;
+    std::vector<struct ggml_tensor*>& decoder_tail_tensors;
 };
 
 // Safely reshapes a 1D bias tensor to [1, Channels] to broadcast across Time
@@ -98,6 +99,107 @@ struct ggml_tensor* execute_encoder_layer(GraphContext& gctx, struct ggml_tensor
     current_channels = x->ne[1];
     
     return x;
+}
+
+// Abstract a single Decoder Layer pass
+struct ggml_tensor* execute_decoder_layer(GraphContext& gctx, struct ggml_tensor* x, int layer_idx, int& current_time_len, int& current_channels) {
+    std::string prefix = "decoder." + std::to_string(layer_idx);
+
+    // Load Weights
+    struct ggml_tensor* conv1x1_w = gctx.model.tensors.at(prefix + ".conv1x1.weight");
+    struct ggml_tensor* conv1x1_b = gctx.model.tensors.at(prefix + ".conv1x1.bias");
+    struct ggml_tensor* trans_w   = gctx.model.tensors.at(prefix + ".trans_conv.conv_t.weight");
+    struct ggml_tensor* trans_b   = gctx.model.tensors.at(prefix + ".trans_conv.conv_t.bias");
+
+    // ========================================================================
+    // 1. U-NET SKIP CONNECTION (Phase Restoration)
+    // ========================================================================
+    // Decoder 0 maps to Encoder 5. Decoder 1 maps to Encoder 4, etc.
+    int skip_idx = gctx.model.num_encoder_layers - 1 - layer_idx;
+    
+    // Retrieve the raw skip tensor we saved during the Encoder pass
+    struct ggml_tensor* skip_t = gctx.skips[skip_idx];
+    
+    // Retrieve the learned scalar gain [1] and broadcast it across the skip tensor
+    struct ggml_tensor* skip_gain = gctx.model.tensors.at("skip_gains." + std::to_string(skip_idx));
+    struct ggml_tensor* gain_reshaped = ggml_reshape_2d(gctx.ctx, skip_gain, 1, 1);
+    struct ggml_tensor* gain_repeated = ggml_repeat(gctx.ctx, gain_reshaped, skip_t);
+    
+    struct ggml_tensor* scaled_skip = ggml_mul(gctx.ctx, skip_t, gain_repeated);
+
+    // Add the high-resolution phase data back into our semantic audio path
+    x = ggml_add(gctx.ctx, x, scaled_skip);
+
+    // ========================================================================
+    // 2. CHANNEL MIXING 
+    // ========================================================================
+    x = ggml_conv_1d(gctx.ctx, conv1x1_w, x, 1, 0, 1);
+    x = apply_bias(gctx.ctx, x, conv1x1_b);
+    x = ggml_silu(gctx.ctx, x);
+
+    // ========================================================================
+    // 3. UPSAMPLING (Transposed Convolution)
+    // ========================================================================
+    int stride = gctx.model.stride; // 2
+    
+    // ggml_conv_transpose_1d creates an output of length: (Time - 1) * stride + kernel
+    x = ggml_conv_transpose_1d(gctx.ctx, trans_w, x, stride, 0, 1);
+    x = apply_bias(gctx.ctx, x, trans_b);
+
+    // ========================================================================
+    // 4. THE "IS_LAST" CHECK (Preserve the negative audio waveform)
+    // ========================================================================
+    // If this is NOT the final layer of the U-Net, apply activation.
+    bool is_last = (layer_idx == gctx.model.num_encoder_layers - 1);
+    if (!is_last) {
+        x = ggml_silu(gctx.ctx, x);
+    }
+
+    // ========================================================================
+    // 5. OVERLAP-ADD (OLA) PHYSICS
+    // ========================================================================
+    int target_time = current_time_len * stride;
+    int channels = x->ne[1];
+    int kernel_size = trans_w->ne[0];
+    int overlap_len = kernel_size - stride; // 4 - 2 = 2 samples of overlap
+
+    // Pre-allocate the final continuous warehouse for this layer: [target_time, channels]
+    struct ggml_tensor* out_assembled = ggml_new_tensor_2d(gctx.ctx, GGML_TYPE_F32, target_time, channels);
+
+    // A. THE HEAD (Overlaps with the previous frame's tail)
+    // Slice the first 2 ticks of Time (Time is on the X-axis / ne[0])
+    struct ggml_tensor* x_head = ggml_view_2d(gctx.ctx, x, overlap_len, channels, x->nb[1], 0);
+
+    // Load the tail from the previous audio frame from our AudioStateCache
+    struct ggml_tensor* cache_tensor = ggml_new_tensor_2d(gctx.ctx, GGML_TYPE_F32, overlap_len, channels);
+    memcpy(cache_tensor->data, gctx.state.decoder_states[layer_idx].cache.data(), overlap_len * channels * sizeof(float));
+
+    // Mathematically ADD them together and drop into the front of the warehouse
+    struct ggml_tensor* head_added = ggml_add(gctx.ctx, x_head, cache_tensor);
+    struct ggml_tensor* view_out_head = ggml_view_2d(gctx.ctx, out_assembled, overlap_len, channels, out_assembled->nb[1], 0);
+    gctx.enforced_deps.push_back(ggml_cpy(gctx.ctx, head_added, view_out_head));
+
+    // B. THE BODY (Passes straight through)
+    int body_len = target_time - overlap_len;
+    size_t body_offset = overlap_len * x->nb[0]; // Byte offset down the X-axis
+    struct ggml_tensor* x_body = ggml_view_2d(gctx.ctx, x, body_len, channels, x->nb[1], body_offset);
+
+    size_t out_body_offset = overlap_len * out_assembled->nb[0];
+    struct ggml_tensor* view_out_body = ggml_view_2d(gctx.ctx, out_assembled, body_len, channels, out_assembled->nb[1], out_body_offset);
+    gctx.enforced_deps.push_back(ggml_cpy(gctx.ctx, x_body, view_out_body));
+
+    // C. THE TAIL (Save for the NEXT audio frame)
+    size_t tail_offset = target_time * x->nb[0];
+    struct ggml_tensor* x_tail = ggml_view_2d(gctx.ctx, x, overlap_len, channels, x->nb[1], tail_offset);
+
+    // Push to our tracking vector so Phase 5 can extract it to the C++ cache
+    gctx.decoder_tail_tensors.push_back(x_tail);
+
+    // Update tracking dimensions for the next loop
+    current_time_len = target_time;
+    current_channels = channels;
+
+    return out_assembled;
 }
 
 // Applies the depthwise 1D Convolution for Branch 1 of the Mamba Block
@@ -421,6 +523,7 @@ bool process_audio_frame(
     std::vector<struct ggml_tensor*> encoder_padded_tensors;
     std::vector<struct ggml_tensor*> mamba_padded_tensors;
     std::vector<struct ggml_tensor*> mamba_final_ssm_states;
+    std::vector<struct ggml_tensor*> decoder_tail_tensors;
 
     // Package the references cleanly
     GraphContext gctx = {
@@ -431,7 +534,8 @@ bool process_audio_frame(
         skips,
         encoder_padded_tensors,
         mamba_padded_tensors,
-        mamba_final_ssm_states
+        mamba_final_ssm_states,
+        decoder_tail_tensors
     };
 
     // ========================================================================
@@ -489,8 +593,13 @@ bool process_audio_frame(
     printf("[DEBUG] Phase 2 Complete. Shape: [Time: %d, Channels: %d]\n", current_time_len, current_channels);
 
     // ========================================================================
-    // (Future Phase 3 - DECODER)
+    // 5. DECODER LOOP (Semantic to Acoustic Representation)
     // ========================================================================
+    for (int i = 0; i < model.num_encoder_layers; i++) { // we can use num_encoder_layers here because the encoder/decoder are symmetrical.
+        x = execute_decoder_layer(gctx, x, i, current_time_len, current_channels);
+    }
+
+    printf("[DEBUG] Phase 3 Complete. Final shape: [Time: %d, Channels: %d]\n", current_time_len, current_channels);
 
     ggml_free(ctx);
     return true; 
