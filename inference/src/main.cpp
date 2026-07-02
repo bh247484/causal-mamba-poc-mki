@@ -49,6 +49,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // Debug print of model.
+    inspect_model(model);
+
     // Initialize the temporal memory arena
     AudioStateCache state;
     if (!state.init(model)) {
@@ -56,6 +59,9 @@ int main(int argc, char** argv) {
         free_model(model);
         return 1;
     }
+
+    // Debug print of state cache.
+    state.inspect();
 
     // Placeholder dummy audio buffers to test compilation.
     float input_audio[128] = {0.0f};
@@ -68,11 +74,6 @@ int main(int argc, char** argv) {
         output_audio,
         128
     );
-
-    // Debug print of model.
-    inspect_model(model);
-    // Debug print of state cache.
-    state.inspect();
 
     // 3. Threading & Execution Lifecycle
     if (config.streaming_mode) {

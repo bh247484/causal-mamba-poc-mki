@@ -27,23 +27,31 @@ void inspect_model(const EdgeAudioModel& model) {
     // Iterate through our std::map of tensors
     for (const auto& pair : model.tensors) {
         const std::string& name = pair.first;
-        struct ggml_tensor* t = pair.second;
+        struct ggml_tensor* tensor = pair.second;
         actual_tensor_count++;
-        int n_dims = ggml_n_dims(t);
+        int n_dims = ggml_n_dims(tensor);
 
         // Build a string representing the shape [ne[0], ne[1], ...]
         std::string shape_str = "[";
         for (int i = 0; i < n_dims; i++) {
-            shape_str += std::to_string(t->ne[i]);
+            shape_str += std::to_string(tensor->ne[i]);
             if (i < n_dims - 1) shape_str += ", ";
         }
         shape_str += "]";
 
-        int elements = ggml_nelements(t);
+        int elements = ggml_nelements(tensor);
         total_elements += elements;
-        actual_loaded_bytes += ggml_nbytes(t);
+        actual_loaded_bytes += ggml_nbytes(tensor);
 
-        printf("%-45s | %-15s | %d\n", name.c_str(), shape_str.c_str(), elements);
+        // 2. Extract the native GGML type
+        const char* type_str = "UNKN";
+        if (tensor->type == GGML_TYPE_F32) {
+            type_str = "FP32";
+        } else if (tensor->type == GGML_TYPE_F16) {
+            type_str = "FP16";
+        }
+
+        printf("%-45s | %-15s | %-6s | %d\n", name.c_str(), shape_str.c_str(), type_str, elements);
     }
 
 printf("========================================================\n");
@@ -58,7 +66,7 @@ printf("========================================================\n");
     size_t actual_arena      = actual_loaded_bytes + actual_overhead + actual_padding;
     
     printf("Total Parameters  : %d\n", total_elements);
-    printf("Payload Memory    : %d bytes (~%.2f MB)\n", 
+    printf("Payload Memory    : %zu bytes (~%.2f MB)\n", 
            actual_loaded_bytes, actual_loaded_bytes / (1024.0f * 1024.0f));
     printf("Struct Overhead   : %zu bytes (Metadata & Padding)\n", 
            actual_overhead + actual_padding);
