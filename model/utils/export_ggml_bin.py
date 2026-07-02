@@ -2,6 +2,10 @@ import torch
 import struct
 from model import EdgeAudioUSE
 
+# GGML float type Enums
+GGML_TYPE_F32 = 0
+GGML_TYPE_F16 = 1
+
 """
 GGML Binary Exporter for EdgeAudioUSE
 
@@ -58,16 +62,20 @@ def main():
     # Calculate require memory allocation footprint
     total_float_bytes = 0
     tensor_count = 0
-    model_dtype_bytes = 0
-    for name, tensor in model.named_parameters():
-        if tensor.requires_grad:
-            # tensor.element_size() returns exactly 4 for FP32, 2 for FP16, etc.
-            total_float_bytes += tensor.numel() * tensor.element_size()
-            tensor_count += 1
 
-            # Assign float size if not already calculated
-            if model_dtype_bytes == 0:
-                model_dtype_bytes = tensor.element_size()
+    for name, tensor in model.named_parameters():
+        if not tensor.requires_grad:
+            continue
+            
+        tensor_count += 1
+
+        # Mixed Precision Logic: Convolutions are FP16 (2 bytes), everything else is FP32 (4 bytes)
+        is_conv_weight = ("conv" in name or "proj" in name) and ("weight" in name)
+        
+        if is_conv_weight:
+            total_float_bytes += tensor.numel() * 2 # FP16
+        else:
+            total_float_bytes += tensor.numel() * 4 # FP32
 
     # 2. Open the binary file in 'wb' (Write Binary) mode
     print(f"\nWriting to {bin_out_path}...")
@@ -90,7 +98,6 @@ def main():
         f.write(struct.pack("i", model.stride))
         f.write(struct.pack("i", total_float_bytes))
         f.write(struct.pack("i", tensor_count))
-        f.write(struct.pack("i", model_dtype_bytes))
         
         print(
             "Header written: "
@@ -100,50 +107,49 @@ def main():
             f"kernel={model.kernel_size}, "
             f"stride={model.stride}, "
             f"total_float_bytes={total_float_bytes}, "
-            f"tensor_count={tensor_count}, "
-            f"model_dtype_bytes={model_dtype_bytes}\n"
+            f"tensor_count={tensor_count}\n"
         )
 
         # ---------------------------------------------------------
         # TENSOR BLOCK
         # ---------------------------------------------------------
-        
         for name, tensor in model.named_parameters():
-            # Skip gradients or anything not strictly necessary for inference
             if not tensor.requires_grad:
                 continue
             
-            # 1. Convert tensor to a flat, contiguous float (FP32 or FP16) NumPy array
+            # 1. Apply Mixed Precision Cast
+            is_conv_weight = ("conv" in name or "proj" in name) and ("weight" in name)
+            
+            # Convert tensor to a flat, contiguous float (FP32 or FP16) NumPy array
             # .detach() removes gradient tracking, .numpy() converts to raw C array
-            data = tensor.detach().cpu().numpy()
+            if is_conv_weight:
+                data = tensor.detach().half().cpu().numpy()
+                ggml_type = GGML_TYPE_F16
+            else:
+                data = tensor.detach().cpu().numpy() # Defaults to FP32
+                ggml_type = GGML_TYPE_F32
             
             # 2. Extract Shape
             n_dims = len(data.shape)
             shape = data.shape
-            
-            # Encode the string name to utf-8 bytes
             name_bytes = name.encode('utf-8')
             
             # --- WRITE THE TENSOR "BOXCAR" ---
-            
-            # Write name length
             f.write(struct.pack("i", len(name_bytes)))
-            
-            # Write the string bytes themselves
             f.write(name_bytes)
-            
-            # Write number of dimensions
             f.write(struct.pack("i", n_dims))
             
-            # Write each dimension size
             for dim_size in shape:
                 f.write(struct.pack("i", dim_size))
                 
-            # Write the raw float data
+            # 3. WRITE THE TENSOR DTYPE (NEW!)
+            f.write(struct.pack("i", ggml_type))
+                
+            # 4. Write the raw float data
             # .tobytes() dumps the entire NumPy array into binary in one instant operation
             f.write(data.tobytes())
             
-            print(f"Packed: {name.ljust(40)} | Shape: {str(shape).ljust(15)} | Dims: {n_dims}")
+            print(f"Packed: {name.ljust(40)} | Shape: {str(shape).ljust(15)} | Dims: {n_dims} | Type: {ggml_type}")
 
     print(f"\n✅ SUCCESS: Exported {tensor_count} tensors to {bin_out_path}")
 

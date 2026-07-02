@@ -1,5 +1,10 @@
 import struct
 import math
+import os
+
+# GGML float type Enums
+GGML_TYPE_F32 = 0
+GGML_TYPE_F16 = 1
 
 def main():
     print("--- Binary File Inspector ---")
@@ -22,7 +27,6 @@ def main():
         stride = struct.unpack("i", f.read(4))[0]
         total_float_bytes = struct.unpack("i", f.read(4))[0]
         tensor_count = struct.unpack("i", f.read(4))[0]
-        model_dtype_bytes = struct.unpack("i", f.read(4))[0]
         print(
             "Config: "
             f"num_encoder_layers={num_encoder_layers}, "
@@ -31,11 +35,10 @@ def main():
             f"kernel={kernel}, "
             f"stride={stride}, "
             f"total_float_bytes={total_float_bytes}, "
-            f"tensor_count={tensor_count}, "
-            f"model_dtype_bytes={model_dtype_bytes}\n"
+            f"tensor_count={tensor_count}\n"
           )
         
-        print(f"{'Tensor Name'.ljust(40)} | {'Shape'.ljust(15)} | Elements")
+        print(f"{'Tensor Name'.ljust(40)} | {'Shape'.ljust(15)} | {'Type'.ljust(6)} | Elements")
         print("-" * 75)
 
         while True:
@@ -56,17 +59,31 @@ def main():
             for _ in range(n_dims):
                 shape.append(struct.unpack("i", f.read(4))[0])
             
-            # 4. Calculate total floats in this tensor
-            # (Scalars like skip_gains have 0 dimensions, meaning exactly 1 element)
+            # 4. Read the Per-Tensor Precision Type
+            ggml_type = struct.unpack("i", f.read(4))[0]
+            
+            # 5. Calculate total floats in this tensor
             if n_dims == 0:
                 num_elements = 1 
             else:
                 num_elements = math.prod(shape)
+                
+            # Determine human-readable type and byte size
+            if ggml_type == GGML_TYPE_F32:
+                type_str = "FP32"
+                bytes_per_element = 4
+            elif ggml_type == GGML_TYPE_F16:
+                type_str = "FP16"
+                bytes_per_element = 2
+            else:
+                type_str = "UNKN"
+                bytes_per_element = 4
             
-            print(f"{name.ljust(40)} | {str(shape).ljust(15)} | {num_elements}")
+            print(f"{name.ljust(40)} | {str(shape).ljust(15)} | {type_str.ljust(6)} | {num_elements}")
             
-            # 5. Skip the float bytes to advance the "read head" to the next tensor
-            f.read(num_elements * model_dtype_bytes)
+            # 6. Fast-forward the read head past the raw float payload
+            # If we don't do this, the next iteration will read a float instead of the name_len
+            f.seek(num_elements * bytes_per_element, os.SEEK_CUR)
             
         print("-" * 75)
         print(f"✅ Successfully traversed to EOF. Counted {tensor_count} tensors.")
