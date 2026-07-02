@@ -6,6 +6,8 @@ from model import EdgeAudioUSE
 GGML_TYPE_F32 = 0
 GGML_TYPE_F16 = 1
 
+CHECKPOINT_FILE_PATH = "tb_logs/StageA_Overfit/version_14/checkpoints/use-overfit-epoch=451-train_loss=0.1980.ckpt"
+
 """
 GGML Binary Exporter for EdgeAudioUSE
 
@@ -41,7 +43,7 @@ def main():
     print("--- Stage B: GGML Binary Exporter ---")
 
     # 1. Load the exact same checkpoint you used in the streaming simulation
-    ckpt_path = "tb_logs/StageA_Overfit/version_12/checkpoints/use-overfit-epoch=496-train_loss=0.2653.ckpt"
+    ckpt_path = CHECKPOINT_FILE_PATH
     bin_out_path = "edge_audio_use.bin"
     
     print(f"Loading weights from {ckpt_path}...")
@@ -59,6 +61,34 @@ def main():
     model.load_state_dict(cleaned_state_dict, strict=True)
     model.eval()
 
+    # Collect all conv layers so we can check against them later
+    # Conv layers will have f16 precision, all other layers will have f32
+    # GGML's conv layers are fundamentally incompatible with f32, they must be f16
+    conv_weight_tensors = set()
+
+    # We need to leave out `model.mamba_blocks` but all other conv blocks should be compressed to f16.
+    fp16_zones = [
+        model.encoder, 
+        model.decoder, 
+        model.proj_in, 
+        model.proj_out
+    ]
+    
+    for zone in fp16_zones:
+        for module in zone.modules():
+            if isinstance(module, (torch.nn.Conv1d, torch.nn.ConvTranspose1d)):
+                if hasattr(module, 'weight') and module.weight is not None:
+                    conv_weight_tensors.add(module.weight)
+    
+    for name, module in model.named_modules():
+        # Check the actual underlying class type
+        if isinstance(module, (torch.nn.Conv1d, torch.nn.ConvTranspose1d)):
+            if hasattr(module, 'weight') and module.weight is not None:
+                # Entire mamba blocks should be f32, even the conv layers inside it
+                if "mamba" not in name:
+                    # Add the specific tensor memory reference to our set
+                    conv_weight_tensors.add(module.weight)
+
     # Calculate require memory allocation footprint
     total_float_bytes = 0
     tensor_count = 0
@@ -70,7 +100,7 @@ def main():
         tensor_count += 1
 
         # Mixed Precision Logic: Convolutions are FP16 (2 bytes), everything else is FP32 (4 bytes)
-        is_conv_weight = ("conv" in name or "proj" in name) and ("weight" in name)
+        is_conv_weight = tensor in conv_weight_tensors
         
         if is_conv_weight:
             total_float_bytes += tensor.numel() * 2 # FP16
@@ -118,7 +148,7 @@ def main():
                 continue
             
             # 1. Apply Mixed Precision Cast
-            is_conv_weight = ("conv" in name or "proj" in name) and ("weight" in name)
+            is_conv_weight = tensor in conv_weight_tensors
             
             # Convert tensor to a flat, contiguous float (FP32 or FP16) NumPy array
             # .detach() removes gradient tracking, .numpy() converts to raw C array
