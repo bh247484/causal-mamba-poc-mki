@@ -26,7 +26,6 @@ struct EdgeAudioModel {
     // Sum memory allocated for tensor floats across the model.
     int total_float_bytes = 0;
     int tensor_count = 0;
-    int model_dtype_bytes = 0; // 4 bytes for float32, 2 bytes for float16
 };
 
 // Initializes the model and loads weights from the .bin file

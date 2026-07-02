@@ -15,12 +15,12 @@ void inspect_model(const EdgeAudioModel& model) {
     printf("  d_model           : %d\n", model.d_model);
     printf("  kernel_size       : %d\n", model.kernel_size);
     printf("  stride            : %d\n", model.stride);
-    printf("  Dtype Size        : %d bytes (2=FP16, 4=FP32)\n", model.model_dtype_bytes);
     printf("  Expected Tensors  : %d\n", model.tensor_count);
     printf("--------------------------------------------------------\n");
     printf("%-45s | %-15s | Elements\n", "Tensor Name", "GGML Shape (ne)");
     printf("--------------------------------------------------------\n");
 
+    size_t actual_loaded_bytes = 0;
     int total_elements = 0;
     int actual_tensor_count = 0;
 
@@ -41,13 +41,12 @@ void inspect_model(const EdgeAudioModel& model) {
 
         int elements = ggml_nelements(t);
         total_elements += elements;
+        actual_loaded_bytes += ggml_nbytes(t);
 
         printf("%-45s | %-15s | %d\n", name.c_str(), shape_str.c_str(), elements);
     }
 
 printf("========================================================\n");
-    
-    int actual_loaded_bytes = total_elements * model.model_dtype_bytes;
     
     // DETERMINISTIC ARENA CALCULATION (Expected vs Actual)
     size_t expected_overhead = model.tensor_count * ggml_tensor_overhead();
@@ -110,7 +109,6 @@ bool load_model(const std::string& bin_path, EdgeAudioModel& model) {
     fread(&model.stride, sizeof(int), 1, bin_file);
     fread(&model.total_float_bytes, sizeof(int), 1, bin_file);
     fread(&model.tensor_count, sizeof(int), 1, bin_file);
-    fread(&model.model_dtype_bytes, sizeof(int), 1, bin_file);
 
     printf(
       "[INFO] Config loaded: "
@@ -120,16 +118,14 @@ bool load_model(const std::string& bin_path, EdgeAudioModel& model) {
       "kernel=%d, "
       "stride=%d, "
       "total_float_bytes=%d, "
-      "tensor_count=%d, "
-      "model_dtype_bytes=%d\n", 
+      "tensor_count=%d\n",
       model.num_encoder_layers,
       model.num_mamba_blocks,
       model.d_model,
       model.kernel_size,
       model.stride,
       model.total_float_bytes,
-      model.tensor_count,
-      model.model_dtype_bytes
+      model.tensor_count
     );
 
            
@@ -176,6 +172,11 @@ bool load_model(const std::string& bin_path, EdgeAudioModel& model) {
             fread(&shape[i], sizeof(int), 1, bin_file);
         }
 
+        // Read float type (GGML_TYPE_F16 for conv layers, GGML_TYPE_F32 for all others)
+        int32_t tensor_dtype;
+        fread(&tensor_dtype, sizeof(int), 1, bin_file);
+        ggml_type ggml_float_type = (ggml_type)tensor_dtype;
+
         // 5. Allocate GGML tensors
         // GGML requires at least 1 dimension. PyTorch scalars (0 dims) become size 1.
         // `ne` == "number of elements"
@@ -192,27 +193,17 @@ bool load_model(const std::string& bin_path, EdgeAudioModel& model) {
             }
         }
 
-        ggml_type ggml_float_type;
-        if (model.model_dtype_bytes == 2) {
-          ggml_float_type = GGML_TYPE_F16;
-        } else if (model.model_dtype_bytes == 4) {
-          ggml_float_type = GGML_TYPE_F32;
-        } else {
-          printf("[ERROR] Unrecognized model float type.\n");
-          fclose(bin_file);
-          return false;
-        }
-
         // Allocate dynamically using the ne array
         struct ggml_tensor* tensor = ggml_new_tensor(model.ggml_ctx, ggml_float_type, ggml_n_dims, ne);
 
         // Set the tensor name (useful for GGML debugging)
         ggml_set_name(tensor, name.c_str());
 
-        // 6. Read the raw float bytes straight into the GGML tensor memory
+        // 6. Read the raw float bytes straight into the GGML tensor memory and calculate byte usage
         size_t elements = ggml_nelements(tensor);
+        size_t bytes_per_element = ggml_type_size(ggml_float_type) / ggml_blck_size(ggml_float_type);
         // Use `model_dtype_bytes` here to dynamically account for (potential) changes to the model's float size, i.e. float32 vs float16.
-        fread(tensor->data, model.model_dtype_bytes, elements, bin_file);
+        fread(tensor->data, bytes_per_element, elements, bin_file);
 
         // Store in our lookup map
         model.tensors[name] = tensor;
