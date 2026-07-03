@@ -1,6 +1,7 @@
 // inference/src/graph.cpp
 #include "graph.h"
 #include "ggml.h"
+#include "ggml-cpu.h"
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -490,6 +491,64 @@ struct ggml_tensor* execute_mamba_block(GraphContext& gctx, struct ggml_tensor* 
     return x_out;
 }
 
+// Extracts the overlap tails and SSM states from the computed GGML arena
+// and safely stores them in the C++ AudioStateCache for the next frame.
+void extract_state_cache(GraphContext& gctx) {
+    AudioStateCache& state = gctx.state;
+    const EdgeAudioModel& model = gctx.model;
+
+    // A. Extract Encoder Overlap Tails (Strided Memory)
+    // Shape is [Time, Channels]. We need the last `overlap_len` floats from each channel row.
+    for (size_t i = 0; i < gctx.encoder_padded_tensors.size(); i++) {
+        struct ggml_tensor* padded = gctx.encoder_padded_tensors[i];
+        int padded_time = padded->ne[0];
+        int channels = padded->ne[1];
+        
+        for (int c = 0; c < channels; c++) {
+            float* src = ((float*)padded->data) + (c * padded_time) + (padded_time - state.overlap_len);
+            float* dst = state.encoder_states[i].cache.data() + (c * state.overlap_len);
+            memcpy(dst, src, state.overlap_len * sizeof(float));
+        }
+    }
+
+    // B. Extract Mamba Conv1D Tails (Contiguous Memory)
+    // Unrolled shape is [Channels, Time]. Time is on the Y-axis. 
+    // The last 3 rows contain all channels perfectly side-by-side.
+    for (size_t i = 0; i < gctx.mamba_padded_tensors.size(); i++) {
+        struct ggml_tensor* padded = gctx.mamba_padded_tensors[i];
+        int channels = padded->ne[0];
+        int padded_time = padded->ne[1];
+        int overlap = 3; // kernel=4 means overlap=3
+        
+        // Offset to the start of the final 3 rows
+        size_t offset_bytes = (padded_time - overlap) * padded->nb[1];
+        float* src = (float*)((char*)padded->data + offset_bytes);
+        memcpy(state.mamba_states[i].conv_state.data(), src, channels * overlap * sizeof(float));
+    }
+
+    // C. Extract Final Mamba SSM Memory (Contiguous Memory)
+    // The hidden state is natively [16, 1024]. We can copy it in one massive block.
+    for (size_t i = 0; i < gctx.mamba_final_ssm_states.size(); i++) {
+        struct ggml_tensor* final_h = gctx.mamba_final_ssm_states[i];
+        memcpy(state.mamba_states[i].ssm_state.data(), final_h->data, ggml_nbytes(final_h));
+    }
+
+    // D. Extract Decoder Overlap Tails (Strided Memory)
+    // x_tail was sliced in the helper, but the underlying RAM still belongs to the parent matrix.
+    // We must respect x_tail->nb[1] to jump to the correct row.
+    for (size_t i = 0; i < gctx.decoder_tail_tensors.size(); i++) {
+        struct ggml_tensor* x_tail = gctx.decoder_tail_tensors[i];
+        int overlap = x_tail->ne[0];
+        int channels = x_tail->ne[1];
+        
+        for (int c = 0; c < channels; c++) {
+            float* src = (float*)((char*)x_tail->data + c * (x_tail->nb[1] / sizeof(float)));
+            float* dst = state.decoder_states[i].cache.data() + (c * overlap);
+            memcpy(dst, src, overlap * sizeof(float));
+        }
+    }
+}
+
 // The clean main entry point
 bool process_audio_frame(
     const EdgeAudioModel& model,
@@ -513,7 +572,7 @@ bool process_audio_frame(
         .no_alloc   = false
     };
     struct ggml_context* ctx = ggml_init(params);
-    struct ggml_cgraph* gf = ggml_new_graph(ctx);
+    struct ggml_cgraph* ggml_graph = ggml_new_graph(ctx);
 
     // We must track specific operations that GGML's backward-walker might miss
     std::vector<struct ggml_tensor*> enforced_deps;
@@ -526,7 +585,7 @@ bool process_audio_frame(
     std::vector<struct ggml_tensor*> decoder_tail_tensors;
 
     // Package the references cleanly
-    GraphContext gctx = {
+    GraphContext graph_context = {
         ctx,
         model,
         state,
@@ -552,7 +611,7 @@ bool process_audio_frame(
     // 3. ENCODER LOOP (Acoustic to Semantic Representation)
     // ========================================================================
     for (int i = 0; i < model.num_encoder_layers; i++) {
-        x = execute_encoder_layer(gctx, x, i, current_time_len, current_channels);
+        x = execute_encoder_layer(graph_context, x, i, current_time_len, current_channels);
     }
 
     printf("[DEBUG] Phase 1 Complete. Bottleneck shape: [Time: %d, Channels: %d]\n", current_time_len, current_channels);
@@ -575,7 +634,7 @@ bool process_audio_frame(
 
     // C. The Sequential Mamba Blocks
     for (int i = 0; i < model.num_mamba_blocks; i++) {
-        x = execute_mamba_block(gctx, x, i, current_time_len);
+        x = execute_mamba_block(graph_context, x, i, current_time_len);
     }
 
     // D. Transpose back to [Time, Channels] for the Decoder
@@ -596,10 +655,39 @@ bool process_audio_frame(
     // 5. DECODER LOOP (Semantic to Acoustic Representation)
     // ========================================================================
     for (int i = 0; i < model.num_encoder_layers; i++) { // we can use num_encoder_layers here because the encoder/decoder are symmetrical.
-        x = execute_decoder_layer(gctx, x, i, current_time_len, current_channels);
+        x = execute_decoder_layer(graph_context, x, i, current_time_len, current_channels);
     }
 
     printf("[DEBUG] Phase 3 Complete. Final shape: [Time: %d, Channels: %d]\n", current_time_len, current_channels);
+
+    // ========================================================================
+    // 6. GRAPH EXECUTION (Phase 4)
+    // ========================================================================
+    // A. Build the forward graph starting from our final audio output
+    ggml_build_forward_expand(ggml_graph, x);
+
+    // B. Force the graph to evaluate our state-tracking copies and SSM updates
+    for (struct ggml_tensor* dep : graph_context.enforced_deps) {
+        ggml_build_forward_expand(ggml_graph, dep);
+    }
+
+    // C. Execute the math on the CPU
+    // For real-time edge processing on tiny chunks, 1 thread minimizes context-switching overhead.
+    int n_threads = 1; 
+    ggml_graph_compute_with_ctx(ctx, ggml_graph, n_threads);
+
+    // D. The graph is finished. Physically copy the final acoustic output to the OS buffer.
+    memcpy(output_audio, x->data, num_samples * sizeof(float));
+
+    // ========================================================================
+    // 7. STATE EXTRACTION (Phase 5 - Cleanup for the next frame)
+    // ========================================================================
+    
+    extract_state_cache(graph_context);
+
+    // Destroy the compute arena. The extracted state cache survives safely in C++.
+    ggml_free(ctx);
+    return true;
 
     ggml_free(ctx);
     return true; 
