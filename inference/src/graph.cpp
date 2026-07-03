@@ -688,7 +688,4 @@ bool process_audio_frame(
     // Destroy the compute arena. The extracted state cache survives safely in C++.
     ggml_free(ctx);
     return true;
-
-    ggml_free(ctx);
-    return true; 
 }
