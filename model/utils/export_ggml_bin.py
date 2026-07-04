@@ -6,7 +6,7 @@ from model import EdgeAudioUSE
 GGML_TYPE_F32 = 0
 GGML_TYPE_F16 = 1
 
-CHECKPOINT_FILE_PATH = "tb_logs/StageA_Overfit/version_14/checkpoints/use-overfit-epoch=451-train_loss=0.1980.ckpt"
+CHECKPOINT_FILE_PATH = "tb_logs/StageA_Overfit/version_19/checkpoints/use-overfit-epoch=494-train_loss=0.1772.ckpt"
 
 """
 GGML Binary Exporter for EdgeAudioUSE

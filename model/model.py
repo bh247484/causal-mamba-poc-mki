@@ -112,7 +112,7 @@ class EdgeAudioUSE(pl.LightningModule, StreamingInferenceMixin):
         
         self.decoder = nn.ModuleList()
         for i, (in_c, out_c) in enumerate(dec_channels):
-            # No ReLU on the absolute final layer (Index 5)
+            # No SiLU activation on the absolute final layer (Index 5)
             is_last = (i == len(dec_channels) - 1)
             self.decoder.append(
                 DecoderBlock(in_c, out_c, kernel_size, stride, is_last, lookahead)
@@ -312,7 +312,7 @@ class EdgeAudioUSE(pl.LightningModule, StreamingInferenceMixin):
             x = x[..., :-overlap_len]
             
             if not block.is_last:
-                x = F.relu(x)
+                x = F.silu(x)
 
         return x[0]
 
