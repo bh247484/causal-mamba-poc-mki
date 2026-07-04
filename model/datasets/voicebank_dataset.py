@@ -21,7 +21,10 @@ class VoiceBankDemandDataset(Dataset):
         # VoiceBank clean and noisy files share the exact same filenames.
         # We read the filenames from the clean directory and assume they exist in the noisy directory.
         # Add sorted() to guarantee cross-platform reproducibility
-        self.filenames = sorted([f for f in os.listdir(clean_dir) if f.endswith('.wav')])
+        # self.filenames = sorted([f for f in os.listdir(clean_dir) if f.endswith('.wav')])
+
+        # Overfit override to ensure we use the same wav file every run.
+        self.filenames = ["p259_330.wav", "p259_330.wav"]
         
         if len(self.filenames) == 0:
             raise RuntimeError(f"No .wav files found in {clean_dir}")
