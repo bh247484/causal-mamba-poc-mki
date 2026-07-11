@@ -26,6 +26,7 @@ target_sources(edge_audio PRIVATE
     src/model.cpp
     src/state.cpp
     src/graph.cpp
+    src/probe.cpp
 )
 
 # 4. Link GGML and include directories
@@ -61,6 +62,7 @@ add_executable(benchmark_looper
     src/model.cpp 
     src/state.cpp 
     src/graph.cpp
+    src/probe.cpp
 )
 
 # 1. Link the exact same GGML base library
