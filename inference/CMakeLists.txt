@@ -51,3 +51,40 @@ endif()
 # -fno-exceptions and -fno-rtti.
 #C++ exceptions add hidden memory overhead to every function.
 # Many edge C++ projects disable them entirely for a 5-10% speed boost.
+
+
+# ---------------------------------------------------------
+# Target 2: The Real-Time Hardware Benchmark
+# ---------------------------------------------------------
+add_executable(benchmark_looper 
+    src/benchmark.cpp 
+    src/model.cpp 
+    src/state.cpp 
+    src/graph.cpp
+)
+
+# 1. Link the exact same GGML base library
+target_link_libraries(benchmark_looper PRIVATE ggml)
+
+# 2. Port the include directories so it can find the headers
+target_include_directories(benchmark_looper PRIVATE 
+    src
+    ggml/include/ggml
+    ggml/src
+)
+
+# 3. Port the aggressive optimization flags for latency testing
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    if(MSVC)
+        target_compile_options(benchmark_looper PRIVATE /O2 /fp:fast)
+    else()
+        target_compile_options(benchmark_looper PRIVATE -O3 -ffast-math)
+    endif()
+endif()
+
+# (Optional macOS requirement for miniaudio hardware access)
+# if (APPLE)
+#     find_library(COREAUDIO_LIB CoreAudio)
+#     find_library(AUDIOTOOLBOX_LIB AudioToolbox)
+#     target_link_libraries(benchmark_looper PRIVATE ${COREAUDIO_LIB} ${AUDIOTOOLBOX_LIB})
+# endif()
