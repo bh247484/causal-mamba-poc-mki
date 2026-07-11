@@ -148,16 +148,7 @@ struct ggml_tensor* execute_decoder_layer(GraphContext& gctx, struct ggml_tensor
     x = apply_bias(gctx.ctx, x, trans_b);
 
     // ========================================================================
-    // 4. THE "IS_LAST" CHECK (Preserve the negative audio waveform)
-    // ========================================================================
-    // If this is NOT the final layer of the U-Net, apply activation.
-    bool is_last = (layer_idx == gctx.model.num_encoder_layers - 1);
-    if (!is_last) {
-        x = ggml_silu(gctx.ctx, x);
-    }
-
-    // ========================================================================
-    // 5. OVERLAP-ADD (OLA) PHYSICS
+    // 4. OVERLAP-ADD (OLA) PHYSICS
     // ========================================================================
     int target_time = current_time_len * stride;
     int channels = x->ne[1];
@@ -195,6 +186,16 @@ struct ggml_tensor* execute_decoder_layer(GraphContext& gctx, struct ggml_tensor
 
     // Push to our tracking vector so Phase 5 can extract it to the C++ cache
     gctx.decoder_tail_tensors.push_back(x_tail);
+
+    // ========================================================================
+    // 5. THE "IS_LAST" CHECK (Preserve the negative audio waveform)
+    // ========================================================================
+    // If this is NOT the final layer of the U-Net, apply activation.
+    // Must apply this activation after overlap add calculated above.
+    bool is_last = (layer_idx == gctx.model.num_encoder_layers - 1);
+    if (!is_last) {
+        x = ggml_silu(gctx.ctx, x);
+    }
 
     // Update tracking dimensions for the next loop
     current_time_len = target_time;
@@ -495,7 +496,6 @@ struct ggml_tensor* execute_mamba_block(GraphContext& gctx, struct ggml_tensor* 
 // and safely stores them in the C++ AudioStateCache for the next frame.
 void extract_state_cache(GraphContext& gctx) {
     AudioStateCache& state = gctx.state;
-    const EdgeAudioModel& model = gctx.model;
 
     // A. Extract Encoder Overlap Tails (Strided Memory)
     // Shape is [Time, Channels]. We need the last `overlap_len` floats from each channel row.
@@ -505,7 +505,12 @@ void extract_state_cache(GraphContext& gctx) {
         int channels = padded->ne[1];
         
         for (int c = 0; c < channels; c++) {
-            float* src = ((float*)padded->data) + (c * padded_time) + (padded_time - state.overlap_len);
+            // Navigate safely down the Y-axis using strict byte strides (nb[1])
+            float* row_ptr = (float*)((char*)padded->data + c * padded->nb[1]);
+            
+            // Now that we are at the exact start of the channel row, 
+            // navigate down the X-axis using standard float pointer arithmetic
+            float* src = row_ptr + (padded_time - state.overlap_len);
             float* dst = state.encoder_states[i].cache.data() + (c * state.overlap_len);
             memcpy(dst, src, state.overlap_len * sizeof(float));
         }
@@ -535,14 +540,14 @@ void extract_state_cache(GraphContext& gctx) {
 
     // D. Extract Decoder Overlap Tails (Strided Memory)
     // x_tail was sliced in the helper, but the underlying RAM still belongs to the parent matrix.
-    // We must respect x_tail->nb[1] to jump to the correct row.
     for (size_t i = 0; i < gctx.decoder_tail_tensors.size(); i++) {
         struct ggml_tensor* x_tail = gctx.decoder_tail_tensors[i];
         int overlap = x_tail->ne[0];
         int channels = x_tail->ne[1];
         
         for (int c = 0; c < channels; c++) {
-            float* src = (float*)((char*)x_tail->data + c * (x_tail->nb[1] / sizeof(float)));
+            // Navigate safely down the Y-axis using strict byte strides (nb[1])
+            float* src = (float*)((char*)x_tail->data + c * x_tail->nb[1]);
             float* dst = state.decoder_states[i].cache.data() + (c * overlap);
             memcpy(dst, src, overlap * sizeof(float));
         }
@@ -663,13 +668,13 @@ bool process_audio_frame(
     // ========================================================================
     // 6. GRAPH EXECUTION (Phase 4)
     // ========================================================================
-    // A. Build the forward graph starting from our final audio output
-    ggml_build_forward_expand(ggml_graph, x);
-
-    // B. Force the graph to evaluate our state-tracking copies and SSM updates
+    // A. Force the graph to evaluate our state-tracking copies and SSM updates
     for (struct ggml_tensor* dep : graph_context.enforced_deps) {
         ggml_build_forward_expand(ggml_graph, dep);
     }
+    
+    // B. Build the forward graph starting from our final audio output
+    ggml_build_forward_expand(ggml_graph, x);
 
     // C. Execute the math on the CPU
     // For real-time edge processing on tiny chunks, 1 thread minimizes context-switching overhead.
