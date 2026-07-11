@@ -2,3 +2,4 @@
 tb_logs/
 */**/__pycache__
 __pycache__
+golden_tensors/
