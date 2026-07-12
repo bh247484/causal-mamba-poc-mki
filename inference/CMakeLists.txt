@@ -5,101 +5,86 @@ project(EdgeAudioUSE VERSION 1.0.0 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
-# Enable global Link-Time Optimization (LTO / Interprocedural Optimization)
-include(CheckIPOSupported)
-check_ipo_supported(RESULT lto_supported OUTPUT error)
-if(lto_supported)
-    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
-    message(STATUS "[OPTIMIZATION] Link-Time Optimization (LTO) enabled for Release builds.")
-else()
-    message(STATUS "[WARNING] LTO not supported by compiler: ${error}")
-endif()
+# --- DIRECTORY STRUCTURE CONVENTIONS ---
+# We keep our root directory clean. 
+# All custom application code lives in src/
+# External submodules (ggml) live in their respective root folders.
 
-# ----------------------------------------------------------------------------
-# 1. HARDWARE & SYSTEM-DEPENDENT ACCELERATION (Isolated Profiles)
-# ----------------------------------------------------------------------------
-if(APPLE)
-    message(STATUS "[OPTIMIZATION] Apple platform detected. Binding Accelerate Framework for AMX/BLAS.")
-    set(GGML_ACCELERATE ON CACHE BOOL "Build GGML with Accelerate framework support" FORCE)
-    
-    find_library(ACCELERATE_FRAMEWORK Accelerate REQUIRED)
-    find_library(COREAUDIO_LIB CoreAudio REQUIRED)
-    find_library(AUDIOTOOLBOX_LIB AudioToolbox REQUIRED)
-    
-    set(PLATFORM_LIBS ${ACCELERATE_FRAMEWORK} ${COREAUDIO_LIB} ${AUDIOTOOLBOX_LIB})
-else()
-    message(STATUS "[OPTIMIZATION] Targeting x86/Enterprise architecture.")
-    set(GGML_ACCELERATE OFF CACHE BOOL "" FORCE)
-    set(PLATFORM_LIBS "")
-endif()
-
-# ----------------------------------------------------------------------------
-# 2. SUBDIRECTORIES
-# ----------------------------------------------------------------------------
+# 1. Bring in the GGML submodule
+# This automatically builds GGML as a static library we can link against.
 add_subdirectory(ggml)
 
-# ----------------------------------------------------------------------------
-# 3. COMPILER OPTIONS & STRIPPING (Target Agnostic)
-# ----------------------------------------------------------------------------
-set(COMMON_INCLUDES
-    src
-    ggml/include/ggml
-    ggml/src
-)
+# 2. Define our main executable
+add_executable(edge_audio)
 
-if(CMAKE_BUILD_TYPE STREQUAL "Release")
-    if(MSVC)
-        set(RELEASE_FLAGS 
-            /O2          
-            /fp:fast     
-            /GR-         
-            /EHs-c-      
-        )
-    else()
-        set(RELEASE_FLAGS 
-            -O3 
-            -ffast-math 
-            -fno-exceptions 
-            -fno-rtti       
-        )
-    endif()
-endif()
-
-# ----------------------------------------------------------------------------
-# 4. TARGET COMPILATION & LINKING
-# ----------------------------------------------------------------------------
-
-# Target 1: Production Engine Binary
-add_executable(edge_audio
+# 3. Append source files to our target
+# This pattern is highly extensible. When you create graph.cpp or audio.cpp,
+# just add them here. We explicitly list them rather than using file(GLOB...) 
+# to prevent CMake caching bugs when adding/removing files.
+target_sources(edge_audio PRIVATE
     src/main.cpp
     src/model.cpp
     src/state.cpp
     src/graph.cpp
     src/probe.cpp
 )
-target_include_directories(edge_audio PRIVATE ${COMMON_INCLUDES})
-target_link_libraries(edge_audio PRIVATE ggml ${PLATFORM_LIBS})
-if(RELEASE_FLAGS)
-    target_compile_options(edge_audio PRIVATE ${RELEASE_FLAGS})
+
+# 4. Link GGML and include directories
+target_link_libraries(edge_audio PRIVATE ggml)
+
+# Tell the compiler where to find our headers and GGML's headers
+target_include_directories(edge_audio PRIVATE 
+    src
+    ggml/include/ggml
+    ggml/src
+)
+
+# Optional: Add aggressive optimization flags for Release builds
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    if(MSVC)
+        target_compile_options(edge_audio PRIVATE /O2 /fp:fast)
+    else()
+        target_compile_options(edge_audio PRIVATE -O3 -ffast-math)
+    endif()
 endif()
 
+# Other optimization flags to consider later:
+# -fno-exceptions and -fno-rtti.
+#C++ exceptions add hidden memory overhead to every function.
+# Many edge C++ projects disable them entirely for a 5-10% speed boost.
 
-# Target 2: Real-Time Hardware Benchmark
-add_executable(benchmark_looper
-    src/benchmark.cpp
-    src/model.cpp
-    src/state.cpp
+
+# ---------------------------------------------------------
+# Target 2: The Real-Time Hardware Benchmark
+# ---------------------------------------------------------
+add_executable(benchmark_looper 
+    src/benchmark.cpp 
+    src/model.cpp 
+    src/state.cpp 
     src/graph.cpp
     src/probe.cpp
 )
-target_include_directories(benchmark_looper PRIVATE ${COMMON_INCLUDES})
-target_link_libraries(benchmark_looper PRIVATE ggml ${PLATFORM_LIBS})
-if(RELEASE_FLAGS)
-    target_compile_options(benchmark_looper PRIVATE ${RELEASE_FLAGS})
+
+# 1. Link the exact same GGML base library
+target_link_libraries(benchmark_looper PRIVATE ggml)
+
+# 2. Port the include directories so it can find the headers
+target_include_directories(benchmark_looper PRIVATE 
+    src
+    ggml/include/ggml
+    ggml/src
+)
+
+# 3. Port the aggressive optimization flags for latency testing
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    if(MSVC)
+        target_compile_options(benchmark_looper PRIVATE /O2 /fp:fast)
+    else()
+        target_compile_options(benchmark_looper PRIVATE -O3 -ffast-math)
+    endif()
 endif()
 
-
-# Target 3: Offline File Processor
+# Add the offline processing executable
 add_executable(offline_processor 
     src/offline_processor.cpp 
     src/graph.cpp 
@@ -107,8 +92,14 @@ add_executable(offline_processor
     src/state.cpp
     src/probe.cpp
 )
-target_include_directories(offline_processor PRIVATE ${COMMON_INCLUDES})
-target_link_libraries(offline_processor PRIVATE ggml ${PLATFORM_LIBS})
-if(RELEASE_FLAGS)
-    target_compile_options(offline_processor PRIVATE ${RELEASE_FLAGS})
-endif()
+
+# Link your existing includes and libraries
+target_include_directories(offline_processor PRIVATE include)
+target_link_libraries(offline_processor PRIVATE ggml) # plus any other system audio libs you are linking
+
+# (Optional macOS requirement for miniaudio hardware access)
+# if (APPLE)
+#     find_library(COREAUDIO_LIB CoreAudio)
+#     find_library(AUDIOTOOLBOX_LIB AudioToolbox)
+#     target_link_libraries(benchmark_looper PRIVATE ${COREAUDIO_LIB} ${AUDIOTOOLBOX_LIB})
+# endif()
