@@ -1,5 +1,6 @@
 // inference/src/graph.cpp
 #include "graph.h"
+#include "probe.h"
 #include "ggml.h"
 #include "ggml-cpu.h"
 #include <cstdio>
@@ -12,6 +13,7 @@ struct GraphContext {
     struct ggml_context* ctx;
     const EdgeAudioModel& model;
     AudioStateCache& state;
+    ProbeRegistry* registry;
     std::vector<struct ggml_tensor*>& enforced_deps;
     std::vector<struct ggml_tensor*>& skips;
     std::vector<struct ggml_tensor*>& encoder_padded_tensors;
@@ -80,10 +82,24 @@ struct ggml_tensor* execute_encoder_layer(GraphContext& gctx, struct ggml_tensor
     struct ggml_tensor* view_back = ggml_view_2d(gctx.ctx, x_padded, current_time_len, current_channels, x_padded->nb[1], offset_bytes);
     gctx.enforced_deps.push_back(ggml_cpy(gctx.ctx, x, view_back)); // Force graph to execute this
 
+    // --- STRATEGIC BRACKETING PROBES ---
+    if (layer_idx == 0) {
+        // Did we build the padded audio correctly?
+        gctx.registry->add_probe("golden_enc_0_step0_padded_input.bin", x_padded);
+        
+        // Did we load the weights into memory correctly?
+        gctx.registry->add_probe("golden_enc_0_step0_weights.bin", conv_w);
+    }
+    // -----------------------------------
+
     // Downsampling 1D Convolution
     // ggml_conv_1d args: (ctx, weight, input, stride, pad, dilation)
     x = ggml_conv_1d(gctx.ctx, conv_w, x_padded, gctx.model.stride, 0, 1);
     x = apply_bias(gctx.ctx, x, conv_b);
+
+    if (layer_idx == 0) {
+        gctx.registry->add_probe("golden_enc_0_step1_conv_out.bin", x);
+    }
 
     // SwiGLU Activation
     x = apply_swiglu(gctx.ctx, x, out_channels);
@@ -578,6 +594,9 @@ bool process_audio_frame(
     struct ggml_context* ctx = ggml_init(params);
     struct ggml_cgraph* ggml_graph = ggml_new_graph(ctx);
 
+    // Probe Code
+    ProbeRegistry registry;
+
     // We must track specific operations that GGML's backward-walker might miss
     std::vector<struct ggml_tensor*> enforced_deps;
     // We save the skip connections for the Decoder (Phase 3)
@@ -593,6 +612,7 @@ bool process_audio_frame(
         ctx,
         model,
         state,
+        &registry,
         enforced_deps,
         skips,
         encoder_padded_tensors,
@@ -608,6 +628,9 @@ bool process_audio_frame(
     struct ggml_tensor* x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, num_samples, 1);
     memcpy(x->data, input_audio, num_samples * sizeof(float));
 
+    // Probe Code
+    registry.add_probe("golden_input.bin", x);
+
     int current_time_len = num_samples;
     int current_channels = 1;
 
@@ -616,6 +639,9 @@ bool process_audio_frame(
     // ========================================================================
     for (int i = 0; i < model.num_encoder_layers; i++) {
         x = execute_encoder_layer(graph_context, x, i, current_time_len, current_channels);
+
+        // Probe Code
+        registry.add_probe("golden_enc_" + std::to_string(i) + "_out.bin", x);
     }
 
     printf("[DEBUG] Phase 1 Complete. Bottleneck shape: [Time: %d, Channels: %d]\n", current_time_len, current_channels);
@@ -631,6 +657,9 @@ bool process_audio_frame(
     x = apply_bias(ctx, x, proj_in_b); // apply_bias works perfectly here because x is [Time, Channels]
     current_channels = proj_in_w->ne[2]; // Now 512!
 
+    // Probe Code
+    registry.add_probe("golden_proj_in_out.bin", x);
+
     // B. Transpose for Mamba (The PyTorch .permute(0, 2, 1) equivalent)
     // We physically flip the axis so Channels sit on ne[0].
     x = ggml_transpose(ctx, x);
@@ -639,6 +668,9 @@ bool process_audio_frame(
     // C. The Sequential Mamba Blocks
     for (int i = 0; i < model.num_mamba_blocks; i++) {
         x = execute_mamba_block(graph_context, x, i, current_time_len);
+
+        // Probe Code
+        registry.add_probe("golden_mamba_" + std::to_string(i) + "_out.bin", x);
     }
 
     // D. Transpose back to [Time, Channels] for the Decoder
@@ -653,6 +685,9 @@ bool process_audio_frame(
     x = apply_bias(ctx, x, proj_out_b);
     current_channels = proj_out_w->ne[2]; // Back to 768!
 
+    // Probe Code
+    registry.add_probe("golden_proj_out_out.bin", x);
+
     printf("[DEBUG] Phase 2 Complete. Shape: [Time: %d, Channels: %d]\n", current_time_len, current_channels);
 
     // ========================================================================
@@ -660,6 +695,9 @@ bool process_audio_frame(
     // ========================================================================
     for (int i = 0; i < model.num_encoder_layers; i++) { // we can use num_encoder_layers here because the encoder/decoder are symmetrical.
         x = execute_decoder_layer(graph_context, x, i, current_time_len, current_channels);
+
+        // Probe Code
+        registry.add_probe("golden_dec_" + std::to_string(i) + "_out.bin", x);
     }
 
     printf("[DEBUG] Phase 3 Complete. Final shape: [Time: %d, Channels: %d]\n", current_time_len, current_channels);
@@ -679,6 +717,13 @@ bool process_audio_frame(
     // For real-time edge processing on tiny chunks, 1 thread minimizes context-switching overhead.
     int n_threads = 1; 
     ggml_graph_compute_with_ctx(ctx, ggml_graph, n_threads);
+
+    // Probe Code
+    // if (!registry.audit()) {
+    //     printf("[FATAL] Golden Tensor Audit Failed! Halting execution.\n");
+    //     ggml_free(ctx);
+    //     exit(1); 
+    // }
 
     // D. The graph is finished. Physically copy the final acoustic output to the OS buffer.
     memcpy(output_audio, x->data, num_samples * sizeof(float));

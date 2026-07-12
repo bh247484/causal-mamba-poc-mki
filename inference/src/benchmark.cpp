@@ -74,6 +74,13 @@ void data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uin
         const float* chunk_in = &(data->wav_data[data->playhead]);
         float* chunk_out = &fOut[i];
 
+        // --- GOLDEN TENSOR IMPULSE OVERRIDE ---
+        // We artificially inject the exact same Impulse Python used.
+        std::vector<float> impulse(chunk_size, 0.0f);
+        impulse[0] = 1.0f;
+        chunk_in = impulse.data(); 
+        // --------------------------------------
+
         // --- BENCHMARK AND INFERENCE ---
         auto start = std::chrono::high_resolution_clock::now();
         
