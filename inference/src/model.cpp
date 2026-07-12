@@ -209,9 +209,11 @@ bool load_model(const std::string& bin_path, EdgeAudioModel& model) {
 
         // 6. Read the raw float bytes straight into the GGML tensor memory and calculate byte usage
         size_t elements = ggml_nelements(tensor);
-        size_t bytes_per_element = ggml_type_size(ggml_float_type) / ggml_blck_size(ggml_float_type);
-        // Use `model_dtype_bytes` here to dynamically account for (potential) changes to the model's float size, i.e. float32 vs float16.
-        fread(tensor->data, bytes_per_element, elements, bin_file);
+        // MULTIPLY FIRST to prevent integer truncation!
+        size_t payload_bytes = (elements * ggml_type_size(ggml_float_type)) / ggml_blck_size(ggml_float_type);
+        
+        // Read the exact payload block in 1-byte chunks
+        fread(tensor->data, 1, payload_bytes, bin_file);
 
         // Store in our lookup map
         model.tensors[name] = tensor;

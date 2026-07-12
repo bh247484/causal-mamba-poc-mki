@@ -103,3 +103,8 @@ target_link_libraries(offline_processor PRIVATE ggml) # plus any other system au
 #     find_library(AUDIOTOOLBOX_LIB AudioToolbox)
 #     target_link_libraries(benchmark_looper PRIVATE ${COREAUDIO_LIB} ${AUDIOTOOLBOX_LIB})
 # endif()
+
+# Quantization script
+add_executable(quantize src/quantize.cpp)
+target_include_directories(quantize PRIVATE src ggml/include/ggml ggml/src)
+target_link_libraries(quantize PRIVATE ggml)
