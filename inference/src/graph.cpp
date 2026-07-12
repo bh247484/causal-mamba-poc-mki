@@ -122,7 +122,7 @@ struct ggml_tensor* execute_decoder_layer(GraphContext& gctx, struct ggml_tensor
     struct ggml_tensor* skip_t = gctx.skips[skip_idx];
     
     // Retrieve the learned scalar gain [1] and broadcast it across the skip tensor
-    struct ggml_tensor* skip_gain = gctx.model.tensors.at("skip_gains." + std::to_string(skip_idx));
+    struct ggml_tensor* skip_gain = gctx.model.tensors.at("skip_gains." + std::to_string(layer_idx));
     struct ggml_tensor* gain_reshaped = ggml_reshape_2d(gctx.ctx, skip_gain, 1, 1);
     struct ggml_tensor* gain_repeated = ggml_repeat(gctx.ctx, gain_reshaped, skip_t);
     
@@ -145,7 +145,6 @@ struct ggml_tensor* execute_decoder_layer(GraphContext& gctx, struct ggml_tensor
     
     // ggml_conv_transpose_1d creates an output of length: (Time - 1) * stride + kernel
     x = ggml_conv_transpose_1d(gctx.ctx, trans_w, x, stride, 0, 1);
-    x = apply_bias(gctx.ctx, x, trans_b);
 
     // ========================================================================
     // 4. OVERLAP-ADD (OLA) PHYSICS
@@ -187,21 +186,21 @@ struct ggml_tensor* execute_decoder_layer(GraphContext& gctx, struct ggml_tensor
     // Push to our tracking vector so Phase 5 can extract it to the C++ cache
     gctx.decoder_tail_tensors.push_back(x_tail);
 
-    // ========================================================================
-    // 5. THE "IS_LAST" CHECK (Preserve the negative audio waveform)
-    // ========================================================================
-    // If this is NOT the final layer of the U-Net, apply activation.
-    // Must apply this activation after overlap add calculated above.
-    bool is_last = (layer_idx == gctx.model.num_encoder_layers - 1);
-    if (!is_last) {
-        x = ggml_silu(gctx.ctx, x);
-    }
-
     // Update tracking dimensions for the next loop
     current_time_len = target_time;
     current_channels = channels;
 
-    return out_assembled;
+    // Apply the transposed bias EXACTLY ONCE to the cleanly assembled frame
+    struct ggml_tensor* final_out = apply_bias(gctx.ctx, out_assembled, trans_b);
+
+    // If this is NOT the final layer, apply the second SiLU to the assembled audio
+    // This preserves the negative audio waveform
+    bool is_last = (layer_idx == gctx.model.num_encoder_layers - 1);
+    if (!is_last) {
+        final_out = ggml_silu(gctx.ctx, final_out);
+    }
+
+    return final_out;
 }
 
 // Applies the depthwise 1D Convolution for Branch 1 of the Mamba Block
