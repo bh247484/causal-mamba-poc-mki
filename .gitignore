@@ -1,4 +1,5 @@
 docs/*.pdf
 **/*.DS_Store
 edge_audio_use.bin
+edge_audio_use_q8.bin
 *.wav
