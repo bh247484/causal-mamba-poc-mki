@@ -47,6 +47,10 @@ struct AudioEngineData {
     
     double total_inference_ms;
     uint64_t total_inference_calls;
+
+    // --- STATIC COMPUTE ARENA ---
+    // This holds the physical 32MB buffer for the active frame graph
+    std::vector<uint8_t> compute_arena;
 };
 
 // ----------------------------------------------------------------------------
@@ -85,7 +89,15 @@ void data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uin
         auto start = std::chrono::high_resolution_clock::now();
         
         // Execute the GGML graph
-        process_audio_frame(*(data->model), *(data->state), chunk_in, chunk_out, chunk_size);
+        process_audio_frame(
+          *(data->model),
+          *(data->state),
+          chunk_in,
+          chunk_out,
+          data->compute_arena.data(), 
+          data->compute_arena.size(),
+          chunk_size
+        );
 
         for (int k = 0; k < chunk_size; k++) {
         if (std::isnan(chunk_out[k]) || std::isinf(chunk_out[k])) {
@@ -118,7 +130,7 @@ int main(int argc, char** argv) {
     std::cout << "      EdgeAudioUSE Real-Time Hardware Testbed           \n";
     std::cout << "========================================================\n";
     
-    std::string model_path = "../edge_audio_use.bin";
+    std::string model_path = "../edge_audio_use_q8.bin";
     std::string input_wav = "../test_loop.wav"; 
 
     // 1. Initialize the GGML Engine
@@ -169,6 +181,9 @@ int main(int argc, char** argv) {
     engineData.playhead = 0;
     engineData.total_inference_ms = 0.0;
     engineData.total_inference_calls = 0;
+
+    // Allocate the 32MB compute playground statically on the main thread
+    engineData.compute_arena.resize(32 * 1024 * 1024);
 
     // 4. Configure the Sound Card
     ma_device_config deviceConfig = ma_device_config_init(ma_device_type_playback);

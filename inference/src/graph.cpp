@@ -575,6 +575,8 @@ bool process_audio_frame(
     AudioStateCache& state,
     const float* input_audio,
     float* output_audio,
+    uint8_t* memory_buffer,
+    size_t memory_size,
     int num_samples
 ) {
     // ========================================================================
@@ -587,8 +589,8 @@ bool process_audio_frame(
     // memory used by the graph and the update our hard coded 32MB amount.
     // 32MB provides reasonable headroom for testing for now though.
     struct ggml_init_params params = {
-        .mem_size   = 32 * 1024 * 1024, // 32 MB - Revisit this
-        .mem_buffer = NULL,
+        .mem_size   = memory_size,
+        .mem_buffer = memory_buffer,
         .no_alloc   = false
     };
     struct ggml_context* ctx = ggml_init(params);

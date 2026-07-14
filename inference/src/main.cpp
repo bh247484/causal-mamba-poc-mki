@@ -67,11 +67,16 @@ int main(int argc, char** argv) {
     float input_audio[128] = {0.0f};
     float output_audio[128] = {0.0f};
 
+    std::vector<uint8_t> compute_arena;
+    compute_arena.resize(32 * 1024 * 1024);
+
     process_audio_frame(
         model,
         state,
         input_audio,
         output_audio,
+        compute_arena.data(),
+        compute_arena.size(),
         128
     );
 

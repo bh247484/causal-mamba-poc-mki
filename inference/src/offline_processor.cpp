@@ -62,6 +62,9 @@ int main(int argc, char** argv) {
     uint64_t total_frames_processed = 0;
     bool processing = true;
 
+    std::vector<uint8_t> compute_arena;
+    compute_arena.resize(32 * 1024 * 1024);
+
     std::cout << "[INFO] Core pipeline processing stream active...\n";
     while (processing) {
         ma_uint64 frames_read = 0;
@@ -79,7 +82,15 @@ int main(int argc, char** argv) {
 
         // --- MATH EXECUTION ---
         // Process the exact physical arrays offline without hardware timing constraints
-        process_audio_frame(model, state, chunk_in.data(), chunk_out.data(), chunk_size);
+        process_audio_frame(
+          model,
+          state,
+          chunk_in.data(),
+          chunk_out.data(),
+          compute_arena.data(), 
+          compute_arena.size(),
+          chunk_size
+        );
 
         // Check for catastrophic math issues before saving
         for (int k = 0; k < chunk_size; k++) {
