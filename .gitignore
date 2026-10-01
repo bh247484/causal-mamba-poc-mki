@@ -3,3 +3,4 @@ docs/*.pdf
 edge_audio_use.bin
 edge_audio_use_q8.bin
 *.wav
+reference-code
