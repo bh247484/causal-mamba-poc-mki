@@ -47,9 +47,7 @@ Anecdotally, this worked quite well. Much better results on overfitting training
 #### Mamba Grad
 <img width="491" height="404" alt="Screenshot 2026-10-24 at 10 05 43 AM" src="https://github.com/user-attachments/assets/990df8bb-7c0c-482b-910a-9c524b0cb26b" />
 
-\
-
-The two training runs without the learned skip gate are `version_6` and `version_9`, the gray and yellow lines respectively. The blue line, `version_19` has the learned skip gate applied. Plainly, introducing the learned skip gate improved both the L1 loss and the STFT loss dramatically. The `mamba_grad_norm` is measured by collecting all mamba block gradients and then L2 normalizing them. Of course I should double back and capture `mamba_grad_norm` measurements for those earlier training runs without the learned parameter to compare exactly how much utilization improved but I haven't had the chance.
+The two training runs without the learned skip gate are `version_6` and `version_9` (the gray and yellow lines) and `version_19` (the blue line) has the learned skip gate applied. Introducing the learned skip gate improved both the L1 loss and the STFT loss dramatically. The `mamba_grad_norm` is measured by collecting all mamba block gradients and then L2 normalizing them. Of course I should double back and capture `mamba_grad_norm` measurements for those earlier training runs without the learned parameter to compare exactly how much utilization improved but I haven't had the chance.
 
 Here's the predicted audio output from each model checkpoint. You'll notice without the learned parameter the predicted output audio much more closely resembles the noisy input (background chatter/voices present) rather than the clean target audio. And the predicted output with the learned skip gate applied eliminates the background chatter entirely, although the audio still contains some high frequency artifacts (high pitch whine/buzz).
 
