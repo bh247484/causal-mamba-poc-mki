@@ -6,9 +6,9 @@ This repo contains proof of concept code for a UNet Mamba Universal Speech Enhan
 
 The model is an attempt to prove real time, edge inference viability for an audio model architecture class that has so far largely been non causal and academic/experimental. It's an attempt to operationalize research.
 
-If you're interested in the code, checkout to the following directories: `inference/` and `model/`.
+If you're interested in the code, checkout to the following directories: [`inference/`](inference/) and [`model/`](model/).
 
-#### The `model/` dir contains...
+#### The [`model`](model/) dir contains...
 - A pytorch lightning implementation of a causal UNet Mamba model with some custom layers/blocks and other useful neural net abstractions.
 - A script to train/overfit the model.
 - Script to export a custom binary file which encodes the various model layers and their weights.
@@ -16,7 +16,7 @@ If you're interested in the code, checkout to the following directories: `infere
 - Script to simulate streaming audio inference.
 - Utility debugging scripts (per layer golden tensor style logging).
 
-#### The `inference/` dir contains...
+#### The [`inference`](inference/) dir contains...
 - A `model` which allocates memory and loads static weights per layer from the custom binary file described above.
 - A `state` cache which preserves and forwards temporal context across streaming audio chunks.
 - A ggml `graph` which contains a custom ggml implementation of the Unet Mamba model with layers and abstractions including...
